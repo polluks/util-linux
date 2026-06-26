@@ -1,0 +1,64 @@
+// Copyright (C) 2024 Karel Zak
+// This file is free software; you may redistribute it under the
+// terms of the GNU General Public License version 2 or (at your option)
+// any later version.
+
+= fsck.affs(8)
+:doctype: manpage
+:revdate: {sysdate}
+
+== NAME
+
+fsck.affs - check the consistency of an Amiga FFS/OFS filesystem
+
+== SYNOPSIS
+
+*fsck.affs* [options] _device_
+
+== DESCRIPTION
+
+*fsck.affs* is used to check the consistency of an Amiga Fast File System (FFS) or Old File System (OFS) filesystem residing on _device_. It validates the filesystem structure, checksums, and bitmap consistency, and can optionally repair detected problems.
+
+== OPTIONS
+
+*-a*, *--auto*::
+  Automatic repair. Answer yes to all repair questions.
+
+*-r*, *--repair*::
+  Interactive repair mode. Ask the user before making changes.
+
+*-v*, *--verbose*::
+  Verbose output. Repeat to increase verbosity.
+
+*-f*, *--force*::
+  Force checking even if the filesystem appears clean.
+
+*-n*, *--no*::
+  No action. Check only, do not write any changes.
+
+*-V*, *--version*::
+  Display version information and exit.
+
+*-h*, *--help*::
+  Display help text and exit.
+
+== EXIT STATUS
+
+0::
+  No errors detected.
+1::
+  File system errors corrected.
+4::
+  File system errors left uncorrected.
+8::
+  Operation error.
+16::
+  Usage or syntax error.
+
+== AUTHORS
+
+mailto:kzak@redhat.com[Karel Zak]
+
+== SEE ALSO
+
+*fsck*(8)

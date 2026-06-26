@@ -62,6 +62,12 @@ fsck_cramfs_sources = files(
 )
 fsck_cramfs_manadocs = files('fsck.cramfs.8.adoc')
 
+fsck_affs_sources = files(
+  'fsck.affs.c',
+) + \
+  ismounted_c
+fsck_affs_manadocs = files('fsck.affs.8.adoc')
+
 raw_sources = files(
   'raw.c',
 )

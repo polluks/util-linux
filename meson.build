@@ -2498,6 +2498,21 @@ if opt and not is_disabler(exe)
   bashcompletions += ['mkfs.cramfs', 'fsck.cramfs']
 endif
 
+opt = get_option('build-affs').allowed()
+exe = executable(
+  'fsck.affs',
+  fsck_affs_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : sbindir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += fsck_affs_manadocs
+  bashcompletions += ['fsck.affs']
+endif
+
 opt = get_option('build-raw').allowed()
 if opt
   cc.has_header('linux/raw.h', required: opt)

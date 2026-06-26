@@ -116,6 +116,16 @@ raw_SOURCES = disk-utils/raw.c
 endif
 
 
+if BUILD_AFFS
+sbin_PROGRAMS += fsck.affs
+MANPAGES += disk-utils/fsck.affs.8
+dist_noinst_DATA += disk-utils/fsck.affs.8.adoc
+fsck_affs_SOURCES = \
+	disk-utils/fsck.affs.c \
+	lib/ismounted.c
+fsck_affs_LDADD = $(LDADD) libcommon.la
+endif
+
 if BUILD_CRAMFS
 cramfs_common_sources = disk-utils/cramfs.h disk-utils/cramfs_common.c
 sbin_PROGRAMS += fsck.cramfs

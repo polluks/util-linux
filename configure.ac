@@ -1786,6 +1786,14 @@ UL_REQUIRES_HAVE([cramfs], [z], [z library])
 AM_CONDITIONAL([BUILD_CRAMFS], [test "x$build_cramfs" = xyes])
 
 
+AC_ARG_ENABLE([affs],
+  AS_HELP_STRING([--disable-affs], [do not build fsck.affs]),
+  [], [UL_DEFAULT_ENABLE([affs], [yes])]
+)
+UL_BUILD_INIT([affs])
+AM_CONDITIONAL([BUILD_AFFS], [test "x$build_affs" = xyes])
+
+
 AC_ARG_ENABLE([bfs],
   AS_HELP_STRING([--disable-bfs], [do not build mkfs.bfs]),
   [], [UL_DEFAULT_ENABLE([bfs], [yes])]

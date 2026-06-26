@@ -127,6 +127,10 @@ if BUILD_FSCK
 dist_bashcompletion_DATA += bash-completion/fsck
 endif
 
+if BUILD_AFFS
+dist_bashcompletion_DATA += bash-completion/fsck.affs
+endif
+
 if BUILD_BFS
 dist_bashcompletion_DATA += bash-completion/mkfs.bfs
 endif

@@ -117,6 +117,10 @@ option('build-agetty', type : 'feature',
        description : 'build agetty')
 option('build-cramfs', type : 'feature',
        description : 'build fsck.cramfs, mkfs.cramfs')
+option('build-affs', type : 'feature',
+  value : 'disabled',
+  description : 'build fsck.affs')
+
 option('build-bfs', type : 'feature',
        description : 'build mkfs.bfs')
 option('build-minix', type : 'feature',

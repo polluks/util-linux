@@ -1,0 +1,24 @@
+_fsck_affs()
+{
+	local cur prev OPTS
+	COMPREPLY=()
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]}"
+	case $prev in
+		'-?')
+			COMPREPLY=( $(compgen -W "arvfnhV" -- "$cur") )
+			return 0
+			;;
+		*)
+			;;
+	esac
+	OPTS="-a -r -v -f -n -h -V"
+	if [[ "$cur" == -* ]]; then
+		COMPREPLY=( $(compgen -W "$OPTS" -- "$cur") )
+		return 0
+	fi
+	COMPREPLY=( $(compgen -W "$OPTS" -- "$cur") )
+	return 0
+}
+
+complete -F _fsck_affs fsck.affs
