@@ -159,6 +159,7 @@ static int bitmap_valid;
 /* Filesystem parameters */
 static uint32_t total_blocks;
 static uint32_t root_block;
+static uint32_t root_from_boot;
 static uint32_t hash_size;
 static uint8_t  volume_name[AFFS_NAMEMAX + 1];
 static uint32_t fstype;
@@ -346,7 +347,6 @@ static int
 read_boot_block(void)
 {
 	unsigned char buf[AFFS_BLOCK_SIZE];
-	uint32_t root_from_boot;
 
 	read_block(0, buf);
 	fstype = be32((uint32_t *)buf);
@@ -416,34 +416,46 @@ read_root_block(void)
 	uint32_t bm_flag_val, stype_val;
 	char vname[256];
 
-	root_block = total_blocks / 2;
-	read_block(root_block, buf);
+	uint32_t root_candidates[2];
+	int n_candidates = 0;
 
-	rh = (struct affs_root_head *)buf;
-	if (be32(&rh->ptype) != T_SHORT) {
-		log_error(_("root block %u: bad type %u (expected %u)"),
-			  root_block, be32(&rh->ptype), T_SHORT);
-		return 0;
+	root_candidates[n_candidates++] = total_blocks / 2;
+	if (root_from_boot > 0 && root_from_boot < total_blocks &&
+	    root_from_boot != total_blocks / 2)
+		root_candidates[n_candidates++] = root_from_boot;
+
+	for (int attempt = 0; attempt < n_candidates; attempt++) {
+		root_block = root_candidates[attempt];
+		read_block(root_block, buf);
+
+		rh = (struct affs_root_head *)buf;
+		if (be32(&rh->ptype) != T_SHORT)
+			continue;
+
+		hash_size = be32(&rh->hash_size);
+		if (hash_size < 4 || hash_size > AFFS_TABLE_ENTRIES)
+			continue;
+
+		if (compute_checksum(buf) != 0)
+			continue;
+
+		/* Root tail is at end of block */
+		rt = (struct affs_root_tail *)(buf + AFFS_BLOCK_SIZE - AFFS_ROOT_TAIL_SIZE);
+		stype_val = be32(&rt->stype);
+		if (stype_val != ST_ROOT)
+			continue;
+
+		goto found_root;
 	}
 
-	hash_size = be32(&rh->hash_size);
-	if (hash_size < 4 || hash_size > AFFS_TABLE_ENTRIES) {
-		log_error(_("root block %u: bad hash size %u"),
-			  root_block, hash_size);
-		return 0;
-	}
+	log_error(_("no valid root block found (tried block %u"),
+		  root_candidates[0]);
+	if (n_candidates > 1)
+		log_error(_(" and block %u"), root_candidates[1]);
+	log_error(_(")"));
+	return 0;
 
-	if (!verify_checksum(buf, root_block))
-		return 0;
-
-	/* Root tail is at end of block */
-	rt = (struct affs_root_tail *)(buf + AFFS_BLOCK_SIZE - AFFS_ROOT_TAIL_SIZE);
-	stype_val = be32(&rt->stype);
-	if (stype_val != ST_ROOT) {
-		log_error(_("root block %u: bad secondary type %d (expected %d)"),
-			  root_block, stype_val, ST_ROOT);
-		return 0;
-	}
+found_root:
 
 	bm_flag_val = be32(&rt->bm_flag);
 	bitmap_valid = (bm_flag_val == (uint32_t)-1);
@@ -505,10 +517,9 @@ build_bitmap_usage(void)
 
 	block_used = xcalloc(total_blocks, 1);
 
-	/* Mark boot blocks and root block as used */
+	/* Mark boot blocks as used (not covered by bitmap) */
 	block_used[0] = 1;
 	block_used[1] = 1;
-	block_used[root_block] = 1;
 
 	/* Count bitmap blocks */
 	for (int i = 0; i < AFFS_ROOT_BMAPS; i++) {
@@ -546,12 +557,16 @@ build_bitmap_usage(void)
 	}
 
 	/* Now read the bitmap data */
+	uint32_t bm_chain = bm_ext;
 	for (int i = 0; i < n_bitmap_blocks; i++) {
 		uint32_t bb;
 		if (i < AFFS_ROOT_BMAPS)
 			bb = bm_blks[i];
-		else
-			bb = bm_ext; /* simplified: just the first ext */
+		else {
+			bb = bm_chain;
+			if (bb == 0 || bb >= total_blocks)
+				break;
+		}
 
 		if (bb == 0 || bb >= total_blocks)
 			continue;
@@ -560,10 +575,23 @@ build_bitmap_usage(void)
 		if (!read_bitmap_block(bb, bmbuf))
 			continue;
 
+		/*
+		 * Extended bitmap blocks use the last 4 bytes as a chain pointer,
+		 * so they have 4032 bits of bitmap data instead of 4064.
+		 */
+		int bits;
+		if (i < AFFS_ROOT_BMAPS)
+			bits = (AFFS_BLOCK_SIZE - 4) * 8;
+		else
+			bits = (AFFS_BLOCK_SIZE - 8) * 8;
+
+		/* Get next in chain (last word of extended bitmap) */
+		if (i >= AFFS_ROOT_BMAPS)
+			bm_chain = be32((uint32_t *)(bmbuf + AFFS_BLOCK_SIZE - 4));
+
 		/* Bitmap data starts at word 1 (after checksum) */
 		uint32_t *bm_words = (uint32_t *)bmbuf;
-		int bits = (AFFS_BLOCK_SIZE - 4) * 8;
-		uint32_t base_blk = i * bits + 2; /* skip boot + root? */
+		uint32_t base_blk = i * ((AFFS_BLOCK_SIZE - 4) * 8) + 2;
 
 		for (int b = 0; b < bits; b++) {
 			uint32_t blk_num = base_blk + b;
@@ -813,7 +841,6 @@ check_directory(uint32_t blk, int depth)
 
 			/* Recurse into subdirectories */
 			if (estype == ST_USERDIR || estype == ST_LINKDIR) {
-				block_used[entry] = 2;
 				check_directory(entry, depth + 1);
 			} else if (estype == ST_FILE || estype == ST_LINKFILE) {
 				block_used[entry] = 2;
