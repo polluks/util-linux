@@ -1255,7 +1255,29 @@ static char *get_mountpoint(	struct cfdisk *cf __attribute__((unused)),
 {
 	return NULL;
 }
-#else
+
+static int is_partlabel_wanted(struct cfdisk *cf __attribute__((unused)))
+{
+	return 0;
+}
+
+#else /* HAVE_LIBMOUNT */
+
+static void read_fstab(struct cfdisk *cf)
+{
+	if (cf->fstab)
+		return;
+
+	cf->fstab = mnt_new_table();
+	if (cf->fstab) {
+		mnt_table_set_cache(cf->fstab, cf->mntcache);
+		if (mnt_table_parse_fstab(cf->fstab, NULL) != 0) {
+			mnt_unref_table(cf->fstab);
+			cf->fstab = NULL;
+		}
+	}
+}
+
 static char *get_mountpoint(struct cfdisk *cf, const char *tagname, const char *tagdata)
 {
 	struct libmnt_fs *fs = NULL;
@@ -1284,16 +1306,8 @@ static char *get_mountpoint(struct cfdisk *cf, const char *tagname, const char *
 
 	/* 2nd try fstab */
 	if (!fs) {
-		if (!cf->fstab) {
-			cf->fstab = mnt_new_table();
-			if (cf->fstab) {
-				mnt_table_set_cache(cf->fstab, cf->mntcache);
-				if (mnt_table_parse_fstab(cf->fstab, NULL) != 0) {
-					mnt_unref_table(cf->fstab);
-					cf->fstab = NULL;
-				}
-			}
-		}
+		if (!cf->fstab)
+			read_fstab(cf);
 		if (cf->fstab)
 			fs = mnt_table_find_tag(cf->fstab, tagname, tagdata, MNT_ITER_FORWARD);
 	} else
@@ -1307,6 +1321,34 @@ static char *get_mountpoint(struct cfdisk *cf, const char *tagname, const char *
 	}
 
 	return target;
+}
+
+static int is_partlabel_wanted(struct cfdisk *cf)
+{
+	struct libmnt_iter *itr;
+	struct libmnt_fs *fs = NULL;
+	int rc = 0;
+
+	if (!cf->fstab)
+		read_fstab(cf);
+	if (!cf->fstab)
+		return 0;
+
+	itr = mnt_new_iter(MNT_ITER_FORWARD);
+	while (mnt_table_next_fs(cf->fstab, itr, &fs) == 0) {
+		const char *tag;
+
+		if (mnt_fs_get_srcpath(fs))
+			continue;	/* ignore paths */
+
+		tag = mnt_fs_get_source(fs);
+		rc = tag && ul_startswith(tag, "PARTLABEL=");
+		if (rc)
+			break;
+	}
+
+	mnt_free_iter(itr);
+	return rc;
 }
 #endif /* HAVE_LIBMOUNT */
 
@@ -1344,15 +1386,15 @@ static void extra_prepare_data(struct cfdisk *cf)
 	struct cfdisk_line *l = &cf->lines[cf->lines_idx];
 	char *data = NULL;
 	char *mountpoint = NULL;
+	char *partname = NULL;
 
 	DBG(UI, ul_debug("preparing extra data"));
 
 	/* string data should not equal an empty string */
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_NAME, &data) && data) {
 		extra_insert_pair(l, _("Partition name:"), data);
-		if (!mountpoint)
-			mountpoint = get_mountpoint(cf, "PARTLABEL", data);
-		free(data);
+		partname = data;
+		data = NULL;
 	}
 
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_UUID, &data) && data) {
@@ -1423,6 +1465,10 @@ static void extra_prepare_data(struct cfdisk *cf)
 		free(data);
 	}
 
+	if (!mountpoint && partname && is_partlabel_wanted(cf))
+		mountpoint = get_mountpoint(cf, "PARTLABEL", partname);
+	free(partname);
+
 	if (mountpoint) {
 		extra_insert_pair(l, _("Mountpoint:"), mountpoint);
 		free(mountpoint);
@@ -1436,7 +1482,7 @@ static int ui_draw_extra(struct cfdisk *cf)
 	struct cfdisk_line *ln = &cf->lines[cf->lines_idx];
 	char *tbstr = NULL, *end;
 	int win_ex_start_line, win_height, tblen;
-	int ndatalines;
+	int ndatalines, rc;
 
 	if (!cf->show_extra)
 		return 0;
@@ -1473,15 +1519,20 @@ static int ui_draw_extra(struct cfdisk *cf)
 	if ((size_t) win_ex_start_line + win_height + 1 < MENU_START_LINE)
 		win_ex_start_line = MENU_START_LINE - win_height;
 
-	win_ex = subwin(stdscr, win_height, ui_cols - 2, win_ex_start_line, 1);
-
 	scols_table_reduce_termwidth(ln->extra, 4);
-	scols_print_table_to_string(ln->extra, &tbstr);
+	rc = scols_print_table_to_string(ln->extra, &tbstr);
+	if (rc < 0 || !tbstr)
+		return 0;
 
 	end = tbstr;
 	while ((end = strchr(end, '\n')))
 		*end++ = '\0';
 
+	win_ex = subwin(stdscr, win_height, ui_cols - 2, win_ex_start_line, 1);
+	if (!win_ex) {
+		free(tbstr);
+		return 0;
+	}
 	box(win_ex, 0, 0);
 
 	end = tbstr;

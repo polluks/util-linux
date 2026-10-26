@@ -266,7 +266,9 @@ extern int string_to_bitmask(const char *list,
 			     long (*name2flag)(const char *, size_t));
 extern int ul_parse_range(const char *str, int *lower, int *upper, int def);
 
+extern const char *ul_path_next_segment(const char *str, size_t *sz);
 extern int streq_paths(const char *a, const char *b);
+extern int ul_path_is_within(const char *path, const char *dir);
 
 /*
  * Match string beginning.
@@ -458,6 +460,32 @@ static inline char *ul_next_string(char *p, char *end)
 	return NULL;
 }
 
+/* Parse string @str and store uint32_t result at @offset in struct @stru */
+static inline int ul_strtou32_to_offset(const char *str, void *stru, size_t offset, int base)
+{
+	if (!stru)
+		return -EINVAL;
+
+	return ul_strtou32(str, (uint32_t *) ((char *) stru + offset), base);
+}
+
+/* Parse string @str and store the result in struct member _m of struct _s */
+#define ul_strtou32_to_struct_member(_s, _m, _str, _base) \
+	ul_strtou32_to_offset(_str, (void *) _s, offsetof(__typeof__(*(_s)), _m), _base)
+
+/* Parse string @str and store int32_t result at @offset in struct @stru */
+static inline int ul_strtos32_to_offset(const char *str, void *stru, size_t offset, int base)
+{
+	if (!stru)
+		return -EINVAL;
+
+	return ul_strtos32(str, (int32_t *) ((char *) stru + offset), base);
+}
+
+/* Parse string @str and store the result in struct member _m of struct _s */
+#define ul_strtos32_to_struct_member(_s, _m, _str, _base) \
+	ul_strtos32_to_offset(_str, (void *) _s, offsetof(__typeof__(*(_s)), _m), _base)
+
 extern char *ul_strnconcat(const char *s, const char *suffix, size_t b);
 extern char *ul_strconcat(const char *s, const char *suffix);
 extern char *ul_strfconcat(const char *s, const char *format, ...)
@@ -479,5 +507,7 @@ extern int ul_stralnumcmp(const char *p1, const char *p2);
 extern int ul_optstr_next(char **optstr, char **name, size_t *namesz, char **value, size_t *valsz);
 extern int ul_optstr_is_valid(const char *optstr);
 extern char *ul_optstr_get_value(const char *optstr, const char *key);
+
+extern size_t ul_unquote(char *str);
 
 #endif /* UTIL_LINUX_STRUTILS */

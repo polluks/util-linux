@@ -85,7 +85,7 @@ Print SIZE in bytes rather than in human readable format.
 Print the size in 512-byte sectors of each given block device. This option is DEPRECATED in favour of *blockdev*(8).
 
 *-t*, *--type* _type_::
-Enable support only for disklabels of the specified _type_, and disable support for all other types.
+Enable support only for disklabels of the specified _type_, and disable support for all other types. This also determines the disklabel type used when *fdisk* automatically creates a new disklabel on an empty device.
 
 *-u*, *--units*[**=**_unit_]::
 When listing partition tables, show sizes in 'sectors' or in 'cylinders'. The default is to show sizes in sectors. For backward compatibility, it is possible to use the option without the _unit_ argument -- then the default is used. Note that the optional _unit_ argument cannot be separated from the *-u* option by a space; the correct form is *-u=cylinders*, for example.
@@ -162,6 +162,9 @@ A BSD/Sun disklabel can describe 8 partitions, the third of which should be a `w
 An IRIX/SGI disklabel can describe 16 partitions, the eleventh of which should be an entire `volume' partition, while the ninth should be labeled `volume header'. The volume header will also cover the partition table, i.e., it starts at block zero and extends by default over five cylinders. The remaining space in the volume header may be used by header directory entries. No partitions may overlap with the volume header. Also do not change its type or make some filesystem on it, since you will lose the partition table. Use this type of label only when working with Linux on IRIX/SGI machines or IRIX/SGI disks under Linux.
 +
 A *sync*(2) and an ioctl(BLKRRPART) (rereading the partition table from disk) are performed before exiting when the partition table has been updated.
+
+*Default label on empty devices*::
+When *fdisk* is given a device with no recognized partition table, it creates one automatically (unless --noauto-pt is used). Since v2.43, on an interactive terminal and on an EFI system, the chosen disklabel is GPT; otherwise, it defaults to DOS/MBR, or SUN on SPARC.
 
 == DOS mode and DOS 6.x WARNING
 

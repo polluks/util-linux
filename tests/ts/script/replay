@@ -48,6 +48,34 @@ ts_finalize_subtest
 
 
 #
+# Divisor must scale the complete delay, not divide tv_sec and tv_usec
+# independently (see https://github.com/util-linux/util-linux/issues/4500).
+# A 1.000000 s delay with divisor 2 has to become ~0.5 s; the old per-field
+# division truncated the whole-seconds field and collapsed it to 0 s.
+#
+ts_init_subtest "divisor-fractional"
+printf '1.000000 1\n' >"$TS_OUTDIR/${TS_TESTNAME}-div-timing"
+printf 'Script started\nX' >"$TS_OUTDIR/${TS_TESTNAME}-div-typescript"
+
+start=$(date +%s.%N)
+$TS_CMD_SCRIPTREPLAY \
+	--divisor 2 \
+	"$TS_OUTDIR/${TS_TESTNAME}-div-timing" \
+	"$TS_OUTDIR/${TS_TESTNAME}-div-typescript" \
+	</dev/null >/dev/null 2>>"$TS_ERRLOG"
+end=$(date +%s.%N)
+elapsed=$(awk -v e="$end" -v s="$start" 'BEGIN{printf "%.3f", e - s}')
+
+# The fix sleeps ~0.5 s; the bug returned in ~0 s.  Use a window that is
+# robust to scheduler jitter but excludes both 0 s (bug) and 1 s (no scaling).
+awk -v t="$elapsed" 'BEGIN{exit (t < 0.20 || t > 0.90) ? 1 : 0}' || {
+	echo "elapsed=${elapsed}s (expected ~0.5s)" >>"$TS_OUTPUT"
+	ts_failed "divisor collapsed delay (elapsed=${elapsed}s)"
+}
+ts_finalize_subtest
+
+
+#
 # New command line format
 #
 ts_init_subtest "output"
@@ -94,5 +122,33 @@ NUMBER=123 $TS_CMD_SCRIPTLIVE \
 	--log-timing "$TIMING_FILE" >> "$TS_OUTPUT" 2>> "$TS_ERRLOG"
 sed -i 's/^[[:alnum:][:punct:][:blank:]]*[\$\#] /prompt> /g' "$TS_OUTPUT"
 ts_finalize_subtest
+
+
+#
+# Delays that no producer emits
+#
+ts_init_subtest "invalid-timing"
+BAD_TIMING="$TS_OUTDIR/${TS_TESTNAME}-bad-timing"
+BAD_LOG="$TS_OUTDIR/${TS_TESTNAME}-bad-typescript"
+echo "hello world" >"$BAD_LOG"
+
+# --maxdelay keeps the clamped delay from stopping the test for a few
+# billion years; the refused delays never get that far.
+function replay_delay {
+	echo "=== $1" >>"$TS_OUTPUT"
+	echo "O $1 12" >"$BAD_TIMING"
+	$TS_CMD_SCRIPTREPLAY \
+		--log-out "$BAD_LOG" \
+		--log-timing "$BAD_TIMING" \
+		--maxdelay 0.01 \
+		</dev/null >/dev/null 2>/dev/null
+	echo "rc=$?" >>"$TS_OUTPUT"
+}
+
+replay_delay "-1.000000"			# negative seconds
+replay_delay "9223372036854775807.000000"	# clamped, would overflow time_t
+replay_delay "1.-00001"				# negative microseconds
+ts_finalize_subtest
+
 
 ts_finalize

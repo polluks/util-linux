@@ -83,7 +83,10 @@ Select a filesystem using the mount node ID.
 Select a filesystem using the mount node 64-bit ID, use with *--kernel=listmount* option.
 
 *-J*, *--json*::
-Use JSON output format.
+Use JSON output format. In the poll mode (*--poll*) the output is a continuous
+stream of the events, where every event is printed as a stand-alone JSON object
+on one line; this is the only usable format for a stream of the events, so
+*LIBSMARTCOLS_JSON* is ignored in this mode.
 
 *-k*, *--kernel*[**=**_method_]::
 Reads information about filesystems from the kernel. This is the default output. The format is tree-like and only includes mount options managed by the kernel (see also *--mtab*).
@@ -97,6 +100,9 @@ The optional argument _method_ is supported only for the long variant (*--kernel
 *-l*, *--list*::
 Use the list output format. This output format is automatically enabled if the output is restricted by the *-t*, *-O*, *-S* or *-T* option and the option *--submounts* is not used or if more that one source file (the option *-F*) is specified.
 
+*--local*::
+Print only local filesystems, i.e. exclude network filesystems like NFS or CIFS. Note that pseudo filesystems (proc, sysfs, tmpfs, ...) are local too; use *--real* in addition to exclude them. This option is mutually exclusive with *--net*.
+
 *-M*, *--mountpoint* _path_::
 Explicitly define the mountpoint file or directory. See also *--target*.
 
@@ -108,6 +114,9 @@ Use alternative namespace _/proc/<tid>/mountinfo_ rather than the default _/proc
 
 *-n*, *--noheadings*::
 Do not print a header line.
+
+*--net*::
+Print only network filesystems (NFS, CIFS, ...). This option is mutually exclusive with *--local*.
 
 *-O*, *--options* _list_::
 Limit the set of printed filesystems. More than one option may be specified in a comma-separated list. The *-t* and *-O* options are cumulative in effect. It is different from *-t* in that each option is matched exactly; a leading _no_ at the beginning does not have global meaning. The "no" can used for individual items in the list. The "no" prefix interpretation can be disabled by "{plus}" prefix.
@@ -162,7 +171,7 @@ Use raw output format. All potentially unsafe characters are hex-escaped (\x<cod
 Note that column SOURCES, use multi-line cells. In these cases, the column may produce more strings on the same line.
 
 *--real*::
-Print only real filesystems.
+Print only real filesystems, i.e. exclude pseudo filesystems. This option is mutually exclusive with *--pseudo*, but it may be combined with *--local* or *--net*, for example *--real --local* prints only local real filesystems.
 
 *-S*, *--source* _spec_::
 Explicitly define the mount source. Supported specifications are _device_, __maj__**:**_min_, **LABEL=**__label__, **UUID=**__uuid__, **PARTLABEL=**__label__ and **PARTUUID=**__uuid__.
@@ -175,6 +184,8 @@ Print only filesystems that are over-mounted by another filesystem.
 
 *-T*, *--target* _path_::
 Define the mount target. If _path_ is not a mountpoint file or directory, then *findmnt* checks the _path_ elements in reverse order to get the mountpoint (this feature is supported only when searching in kernel files and unsupported for *--fstab*). It's recommended to use the option *--mountpoint* when checks of _path_ elements are unwanted and _path_ is a strictly specified mountpoint.
++
+The _path_ is always on one filesystem only, so *--target* always returns at most one filesystem entry. Over-mounted entries for the same mountpoint are skipped.
 
 *-t*, *--types* _list_::
 Limit the set of printed filesystems. More than one type may be specified in a comma-separated list. The list of filesystem types can be prefixed with *no* to specify the filesystem types on which no action should be taken. For more details see *mount*(8).
@@ -210,9 +221,10 @@ include::man-common/help-version.adoc[]
 
 == EXIT STATUS
 
-The exit value is 0 if there is something to display, or 1 on any error
-(for example if no filesystem is found based on the user's filter
-specification, or the device path or mountpoint does not exist).
+The exit value is 0 if there is something to display, or 1 in case of any
+error. An exit value of 1 is also returned when there is nothing to show and a
+user-defined filter is used, or if the device path or mount point does not
+exist.
 
 == ENVIRONMENT
 

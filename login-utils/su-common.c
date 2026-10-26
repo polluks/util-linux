@@ -51,8 +51,6 @@
 # define USE_PTY
 #endif
 
-#include "err.h"
-
 #include <stdbool.h>
 
 #include "c.h"
@@ -563,6 +561,10 @@ static void create_watching_parent(struct su_context *su)
 		if (ul_pty_signals_setup(su->pty)) {
 			supam_cleanup(su, PAM_ABORT);
 			err(EXIT_FAILURE, _("failed to initialize signals handler"));
+		}
+		if (ul_pty_terminal_setup(su->pty)) {
+			supam_cleanup(su, PAM_ABORT);
+			err(EXIT_FAILURE, _("failed to setup terminal"));
 		}
 	}
 #endif

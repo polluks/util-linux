@@ -2,6 +2,7 @@
 
 #include "fdiskP.h"
 #include "cctype.h"
+#include "pathnames.h"
 
 
 /**
@@ -333,6 +334,27 @@ int fdisk_list_disklabel(struct fdisk_context *cxt)
 }
 
 /**
+ * fdisk_get_recommended_labelname:
+ *
+ * Suggests a disklabel type based on the current system: "sun" on SPARC,
+ * "gpt" when booted via EFI, otherwise "dos".
+ *
+ * Returns: label name string
+ * Since: 2.43
+ */
+const char *fdisk_get_recommended_labelname(void)
+{
+#ifdef __sparc__
+	return "sun";
+#else
+	if (access(_PATH_SYS_EFI, F_OK) == 0)
+		return "gpt";
+
+	return "dos";
+#endif
+}
+
+/**
  * fdisk_create_disklabel:
  * @cxt: fdisk context
  * @name: label name
@@ -536,7 +558,8 @@ int fdisk_set_partition_type(struct fdisk_context *cxt,
 {
 	if (!cxt || !cxt->label || !t)
 		return -EINVAL;
-
+	if (partnum >= cxt->label->nparts_max)
+		return -EINVAL;
 
 	if (cxt->label->op->set_part) {
 		struct fdisk_partition *pa = fdisk_new_partition();
@@ -574,6 +597,8 @@ int fdisk_toggle_partition_flag(struct fdisk_context *cxt,
 		return -EINVAL;
 	if (!cxt->label->op->part_toggle_flag)
 		return -ENOSYS;
+	if (partnum >= cxt->label->nparts_max)
+		return -EINVAL;
 
 	rc = cxt->label->op->part_toggle_flag(cxt, partnum, flag);
 

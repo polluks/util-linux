@@ -96,6 +96,8 @@ static const struct fdisk_shortcut dos_parttype_cuts[] =
 
 #define cround(c, n)	fdisk_cround(c, n)
 
+static int get_disk_ranges(struct fdisk_context *cxt, int logical,
+			   fdisk_sector_t *first, fdisk_sector_t *last);
 
 static inline struct fdisk_dos_label *self_label(struct fdisk_context *cxt)
 {
@@ -229,7 +231,7 @@ static int seek_sector(struct fdisk_context *cxt, fdisk_sector_t secno)
 {
 	off_t offset = (off_t) secno * cxt->sector_size;
 
-	return lseek(cxt->dev_fd, offset, SEEK_SET) == (off_t) -1 ? -errno : 0;
+	return ul_vfs_lseek(cxt->vfs, cxt->dev_fd, offset, SEEK_SET) == (off_t) -1 ? -errno : 0;
 }
 
 static int read_sector(struct fdisk_context *cxt, fdisk_sector_t secno,
@@ -241,7 +243,7 @@ static int read_sector(struct fdisk_context *cxt, fdisk_sector_t secno,
 	if (rc < 0)
 		return rc;
 
-	r = read(cxt->dev_fd, buf, cxt->sector_size);
+	r = ul_vfs_read(cxt->vfs, cxt->dev_fd, buf, cxt->sector_size);
 	if (r == (ssize_t) cxt->sector_size)
 		return 0;
 	if (r < 0)
@@ -695,6 +697,7 @@ static int dos_create_disklabel(struct fdisk_context *cxt)
 	if (cxt->script) {
 		char *end = NULL;
 		const char *s = fdisk_script_get_header(cxt->script, "label-id");
+		uint64_t first;
 
 		if (s) {
 			errno = 0;
@@ -704,6 +707,24 @@ static int dos_create_disklabel(struct fdisk_context *cxt)
 				DBG(LABEL, ul_debug("DOS: re-use ID from script (0x%08x)", id));
 			} else
 				DBG(LABEL, ul_debug("DOS: failed to parse label=id '%s'", s));
+		}
+
+		rc = fdisk_script_get_u64(cxt, "first-lba", &first);
+		if (rc < 0)
+			return rc;
+		if (rc == 0) {
+			fdisk_sector_t last;
+
+			rc = get_disk_ranges(cxt, 0, NULL, &last);
+			if (rc)
+				return rc;
+
+			if (first < 1 || first > last) {
+				fdisk_warnx(cxt, _("First LBA specified by script is out of range."));
+				return -ERANGE;
+			}
+			DBG(LABEL, ul_debug("DOS: first LBA from script: %ju", (uintmax_t) first));
+			fdisk_set_first_lba(cxt, first);
 		}
 	}
 
@@ -1253,19 +1274,24 @@ static int get_disk_ranges(struct fdisk_context *cxt, int logical,
 		if (!ext_pe)
 			return -EINVAL;
 
-		*first = l->ext_offset + cxt->first_lba;
-		*last = get_abs_partition_end(ext_pe);
+		if (first)
+			*first = l->ext_offset + cxt->first_lba;
+		if (last)
+			*last = get_abs_partition_end(ext_pe);
 
 	} else {
 		/* primary partitions */
-		if (fdisk_use_cylinders(cxt) || !cxt->total_sectors)
-			*last = cxt->geom.heads * cxt->geom.sectors * cxt->geom.cylinders - 1;
-		else
-			*last = cxt->total_sectors - 1;
+		if (last) {
+			if (fdisk_use_cylinders(cxt) || !cxt->total_sectors)
+				*last = cxt->geom.heads * cxt->geom.sectors * cxt->geom.cylinders - 1;
+			else
+				*last = cxt->total_sectors - 1;
 
-		if (*last >= UINT_MAX)
-			*last = UINT_MAX - 1;
-		*first = cxt->first_lba;
+			if (*last >= UINT_MAX)
+				*last = UINT_MAX - 1;
+		}
+		if (first)
+			*first = cxt->first_lba;
 	}
 
 	return 0;
@@ -2126,7 +2152,7 @@ static int write_sector(struct fdisk_context *cxt, fdisk_sector_t secno,
 
 	DBG(LABEL, ul_debug("DOS: writing to sector %ju", (uintmax_t) secno));
 
-	if (write(cxt->dev_fd, buf, cxt->sector_size) != (ssize_t) cxt->sector_size)
+	if (ul_vfs_write(cxt->vfs, cxt->dev_fd, buf, cxt->sector_size) != (ssize_t) cxt->sector_size)
 		return -errno;
 	return 0;
 }
@@ -2168,12 +2194,20 @@ static int dos_write_disklabel(struct fdisk_context *cxt)
 		/* we have empty extended partition, check if the partition has
 		 * been modified and then cleanup possible remaining EBR  */
 		struct pte *pe = self_pte(cxt, l->ext_index);
-		unsigned char empty[512] = { 0 };
 		fdisk_sector_t off = pe ? get_abs_partition_start(pe) : 0;
 
 		if (off && pe->changed) {
+			unsigned char *empty = calloc(1, cxt->sector_size);
+
+			if (!empty) {
+				rc = -ENOMEM;
+				goto done;
+			}
 			mbr_set_magic(empty);
-			write_sector(cxt, off, empty);
+			rc = write_sector(cxt, off, empty);
+			free(empty);
+			if (rc)
+				goto done;
 		}
 	}
 

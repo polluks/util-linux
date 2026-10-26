@@ -55,13 +55,14 @@
 struct libmnt_context *mnt_new_context(void)
 {
 	struct libmnt_context *cxt;
-	uid_t ruid;
+	uid_t ruid, euid;
 
 	cxt = calloc(1, sizeof(*cxt));
 	if (!cxt)
 		return NULL;
 
 	ruid = getuid();
+	euid = geteuid();
 
 	mnt_context_reset_status(cxt);
 
@@ -75,9 +76,10 @@ struct libmnt_context *mnt_new_context(void)
 
 	INIT_LIST_HEAD(&cxt->hooksets_hooks);
 	INIT_LIST_HEAD(&cxt->hooksets_datas);
+	INIT_LIST_HEAD(&cxt->config_entries);
 
-	/* if we're really root and aren't running setuid */
-	cxt->restricted = (uid_t) 0 == ruid && !is_privileged_execution() ? 0 : 1;
+	/* unrestricted only when the current credentials are fully root */
+	cxt->restricted = (uid_t) 0 == ruid && ruid == euid ? 0 : 1;
 
 	cxt->noautofs = 0;
 
@@ -104,6 +106,12 @@ void mnt_free_context(struct libmnt_context *cxt)
 	free(cxt->optstr_pattern);
 	free(cxt->tgt_prefix);
 
+	if (cxt->vfs) {
+		mnt_table_refer_vfs(cxt->fstab, NULL);
+		mnt_table_refer_vfs(cxt->mountinfo, NULL);
+		mnt_cache_refer_vfs(cxt->cache, NULL);
+		free(cxt->vfs);
+	}
 	mnt_unref_table(cxt->fstab);
 	mnt_unref_cache(cxt->cache);
 	mnt_unref_fs(cxt->fs);
@@ -117,6 +125,7 @@ void mnt_free_context(struct libmnt_context *cxt)
 	mnt_context_set_target_ns(cxt, NULL);
 
 	free(cxt->children);
+	mnt_free_config(cxt);
 
 	DBG_OBJ(CXT, cxt, ul_debug("free"));
 	free(cxt);
@@ -324,6 +333,7 @@ int mnt_context_reset_status(struct libmnt_context *cxt)
 	cxt->syscall_status = 1;		/* means not called yet */
 	cxt->helper_exec_status = 1;
 	cxt->helper_status = 0;
+	cxt->helper_errno = 0;
 	return 0;
 }
 
@@ -401,18 +411,38 @@ int mnt_context_is_restricted(struct libmnt_context *cxt)
 	return cxt->restricted;
 }
 
+/**
+ * mnt_context_set_restricted:
+ * @cxt: mount context
+ * @restricted: TRUE or FALSE
+ *
+ * Explicitly enables or disables restricted mode. Disabling restricted mode
+ * turns off libmount security policies and should only be done when the caller
+ * has independently established that the current credentials are trusted.
+ *
+ * Returns: 0 on success, negative number in case of error.
+ *
+ * Since: 2.43
+ */
+int mnt_context_set_restricted(struct libmnt_context *cxt, int restricted)
+{
+	if (!cxt)
+		return -EINVAL;
+
+	cxt->restricted = restricted ? 1 : 0;
+	DBG_OBJ(CXT, cxt, ul_debug("set %s",
+			cxt->restricted ? "RESTRICTED" : "UNRESTRICTED"));
+	return 0;
+}
+
 int mnt_context_target_fd_required(struct libmnt_context *cxt)
 {
 	return mnt_context_is_restricted(cxt);
 }
 
-int mnt_context_reopen_target_fd(struct libmnt_context *cxt)
+/* re-open the pinned target, see mnt_context_finalize_target() */
+static int reopen_target_fd(struct libmnt_context *cxt)
 {
-	assert(cxt);
-
-	if (!mnt_context_target_fd_required(cxt))
-		return 0;
-
 	DBG_OBJ(CXT, cxt, ul_debug("reopen target fd"));
 
 	mnt_context_close_target_fd(cxt);
@@ -420,26 +450,113 @@ int mnt_context_reopen_target_fd(struct libmnt_context *cxt)
 		return -errno;
 
 	/* verify the mount landed on the expected target;
-	 * cxt->fs->id is set from fd_tree in hook_create_mount() */
-	if (cxt->fs && cxt->fs->id > 0) {
-		int id = 0;
+	 * IDs are set from fd_tree in hook_create_mount().
+	 *
+	 * The ID has already been read from the kernel for this mount, so
+	 * a failure to read it again is unexpected and we handle it as a
+	 * mismatch rather than skip the verification. Old kernels are not
+	 * affected, there is no ID and we do not get here at all.
+	 *
+	 * The same for classic mount(2) and external mount helpers, they give
+	 * us no handle to the new mount, so there is no ID to compare with;
+	 * update_mount_ids() reads the IDs from the mount point instead. */
+	if (cxt->fs && (cxt->fs->uniq_id || cxt->fs->id > 0)) {
+		int mismatch = 0;
 
-		if (mnt_id_from_fd(cxt->fd_target, NULL, &id) == 0
-		    && id != cxt->fs->id) {
-			const char *tgt = mnt_fs_get_target(cxt->fs);
+		if (cxt->fs->uniq_id) {
+			uint64_t uniq_id = 0;
 
-			DBG_OBJ(CXT, cxt, ul_debug(
-				"target mount ID mismatch (expected %d, got %d), umounting",
-				cxt->fs->id, id));
-			if (tgt)
-				umount2(tgt, MNT_DETACH);
+			if (mnt_id_from_fd(cxt->fd_target, &uniq_id, NULL) != 0
+			    || uniq_id != cxt->fs->uniq_id)
+				mismatch = 1;
+		} else {
+			int id = 0;
+
+			if (mnt_id_from_fd(cxt->fd_target, NULL, &id) != 0
+			    || id != cxt->fs->id)
+				mismatch = 1;
+		}
+		if (mismatch) {
+			char fdpath[UL_FDPATH_BUFSIZ];
+
+			DBG_OBJ(CXT, cxt, ul_debug("target mount ID mismatch, umounting"));
+
+			/* Best effort cleanup of the mount we cannot account
+			 * for. Detach through the FD, otherwise the target
+			 * path is resolved for the second time.
+			 *
+			 * Note that this pins the location, not the mount.
+			 * There is no umount-by-FD, umount2() looks up with
+			 * LOOKUP_MOUNTPOINT and always detaches the topmost
+			 * mount at the resolved place, so an overmount is
+			 * removed instead of ours. The /proc symlink has to be
+			 * followed, so no UMOUNT_NOFOLLOW here. */
+			if (ul_fd_mkpath(fdpath, sizeof(fdpath), cxt->fd_target))
+				umount2(fdpath, MNT_DETACH);
 			mnt_context_close_target_fd(cxt);
+			errno = EPERM;
 			return -EPERM;
 		}
-		DBG_OBJ(CXT, cxt, ul_debug("target mount ID verified (%d)", id));
+		DBG_OBJ(CXT, cxt, ul_debug("target mount ID verified"));
 	}
 
 	return 0;
+}
+
+/* store the mount IDs to the utab entry, see mnt_context_finalize_target() */
+static int update_mount_ids(struct libmnt_context *cxt)
+{
+	struct libmnt_fs *fs;
+
+	if (!cxt->fs)
+		return 0;
+
+	/* The IDs are known when the new mount API has been used, the kernel
+	 * gives us a FD to the not yet attached mount. Classic mount(2) and
+	 * external mount helpers provide no such handle, so read the IDs from
+	 * the new mount point (cxt->fd_target, or the target path if the FD is
+	 * not pinned). Note that this is not 100% robust -- another process
+	 * could overmount the target in the meantime. */
+	if (!cxt->fs->uniq_id && cxt->fs->id <= 0)
+		mnt_fs_fetch_ids(cxt->fs, cxt->fd_target);
+
+	if (!cxt->fs->uniq_id && !cxt->fs->id)
+		return 0;
+	if (!cxt->update || !mnt_update_is_ready(cxt->update))
+		return 0;
+
+	fs = mnt_update_get_fs(cxt->update);
+	if (fs) {
+		fs->id = cxt->fs->id;
+		fs->uniq_id = cxt->fs->uniq_id;
+	}
+
+	return 0;
+}
+
+/*
+ * Called by the mount code when the filesystem has been attached to the
+ * target.
+ *
+ * For non-root users it re-opens the pinned target FD, so it refers to the
+ * root of the new mount rather than to the directory covered by the mount, and
+ * verifies that the mount at the target is the one we have created.
+ *
+ * It also reads the mount IDs when the mount operation has not provided them,
+ * and stores the IDs to the utab entry.
+ */
+int mnt_context_finalize_target(struct libmnt_context *cxt)
+{
+	int rc = 0;
+
+	assert(cxt);
+
+	if (mnt_context_target_fd_required(cxt))
+		rc = reopen_target_fd(cxt);
+	if (rc == 0)
+		rc = update_mount_ids(cxt);
+
+	return rc;
 }
 
 int mnt_context_get_target_fd(struct libmnt_context *cxt)
@@ -449,12 +566,15 @@ int mnt_context_get_target_fd(struct libmnt_context *cxt)
 	if (cxt->fd_target < 0) {
 		const char *target = mnt_fs_get_target(cxt->fs);
 
-		if (target) {
-			cxt->fd_target = ul_open_no_symlinks(target,
-						O_PATH | O_CLOEXEC, 0);
-			DBG_OBJ(CXT, cxt, ul_debug("open target fd=%d [%s]",
-						cxt->fd_target, target));
+		if (!target) {
+			/* keep errno usable for callers which use -errno */
+			errno = EINVAL;
+			return -EINVAL;
 		}
+		cxt->fd_target = ul_open_no_symlinks(target,
+					O_PATH | O_CLOEXEC, 0);
+		DBG_OBJ(CXT, cxt, ul_debug("open target fd=%d [%s]",
+					cxt->fd_target, target));
 	}
 	return cxt->fd_target;
 }
@@ -485,12 +605,10 @@ void mnt_context_close_target_fd(struct libmnt_context *cxt)
  */
 int mnt_context_force_unrestricted(struct libmnt_context *cxt)
 {
-	if (mnt_context_is_restricted(cxt)) {
+	if (mnt_context_is_restricted(cxt))
 		DBG_OBJ(CXT, cxt, ul_debug("force UNRESTRICTED"));
-		cxt->restricted = 0;
-	}
 
-	return 0;
+	return mnt_context_set_restricted(cxt, 0);
 }
 
 /**
@@ -1259,6 +1377,12 @@ const char *mnt_context_get_target_prefix(struct libmnt_context *cxt)
  */
 int mnt_context_set_fstype(struct libmnt_context *cxt, const char *fstype)
 {
+	/* the type has been requested by the user */
+	if (fstype)
+		cxt->flags |= MNT_FL_FSTYPE_EXPLICIT;
+	else
+		cxt->flags &= ~MNT_FL_FSTYPE_EXPLICIT;
+
 	return mnt_fs_set_fstype(mnt_context_get_fs(cxt), fstype);
 }
 
@@ -1462,6 +1586,8 @@ int mnt_context_get_fstab(struct libmnt_context *cxt, struct libmnt_table **tb)
 			return -MNT_ERR_NAMESPACE;
 
 		mnt_table_set_cache(cxt->fstab, mnt_context_get_cache(cxt));
+		if (cxt->vfs)
+			mnt_table_refer_vfs(cxt->fstab, cxt->vfs);
 		rc = mnt_table_parse_fstab(cxt->fstab, NULL);
 
 		if (!mnt_context_switch_ns(cxt, ns_old))
@@ -1506,6 +1632,8 @@ int mnt_context_get_mountinfo(struct libmnt_context *cxt, struct libmnt_table **
 					cxt->table_fltrcb_data);
 
 		mnt_table_set_cache(cxt->mountinfo, mnt_context_get_cache(cxt));
+		if (cxt->vfs)
+			mnt_table_refer_vfs(cxt->mountinfo, cxt->vfs);
 	}
 
 	/* Read the table; it's empty, because this first mnt_context_get_mountinfo()
@@ -1668,6 +1796,8 @@ int mnt_context_get_table(struct libmnt_context *cxt,
 
 	if (cxt->table_errcb)
 		mnt_table_set_parser_errcb(*tb, cxt->table_errcb);
+	if (cxt->vfs)
+		mnt_table_refer_vfs(*tb, cxt->vfs);
 
 	ns_old = mnt_context_switch_target_ns(cxt);
 	if (!ns_old)
@@ -1719,6 +1849,45 @@ int mnt_context_set_tables_errcb(struct libmnt_context *cxt,
 }
 
 /**
+ * mnt_context_set_vfs:
+ * @cxt: mount context
+ * @ops: VFS operations or NULL
+ *
+ * Set pluggable VFS I/O operations. The library stores a private copy of @ops.
+ * If @ops is NULL, the VFS is reset to defaults (standard libc I/O).
+ *
+ * The VFS is automatically propagated to the cache (see mnt_cache_refer_vfs())
+ * and to the tables (see mnt_table_refer_vfs()) when they are created or set.
+ *
+ * Returns: 0 on success, negative number in case of error.
+ */
+int mnt_context_set_vfs(struct libmnt_context *cxt, const struct ul_vfs_ops *ops)
+{
+	if (!cxt)
+		return -EINVAL;
+
+	if (!ops) {
+		free(cxt->vfs);
+		cxt->vfs = NULL;
+		return 0;
+	}
+	if (!cxt->vfs) {
+		cxt->vfs = calloc(1, sizeof(*cxt->vfs));
+		if (!cxt->vfs)
+			return -ENOMEM;
+	}
+	ul_vfs_init(cxt->vfs, ops);
+
+	if (cxt->cache)
+		mnt_cache_refer_vfs(cxt->cache, cxt->vfs);
+	if (cxt->fstab)
+		mnt_table_refer_vfs(cxt->fstab, cxt->vfs);
+	if (cxt->mountinfo)
+		mnt_table_refer_vfs(cxt->mountinfo, cxt->vfs);
+	return 0;
+}
+
+/**
  * mnt_context_set_cache:
  * @cxt: mount context
  * @cache: cache instance or NULL
@@ -1748,6 +1917,8 @@ int mnt_context_set_cache(struct libmnt_context *cxt, struct libmnt_cache *cache
 
 	cxt->cache = cache;
 
+	if (cache && cxt->vfs)
+		mnt_cache_refer_vfs(cache, cxt->vfs);
 	if (cxt->mountinfo)
 		mnt_table_set_cache(cxt->mountinfo, cache);
 	if (cxt->fstab)
@@ -1986,7 +2157,9 @@ int mnt_context_open_tree(struct libmnt_context *cxt, const char *path, unsigned
 	DBG_OBJ(CXT, cxt, ul_debug("open_tree(path=%s%s%s)", path,
 				oflg & OPEN_TREE_CLONE ? " clone" : "",
 				oflg & AT_RECURSIVE ? " recursive" : ""));
-	fd = open_tree(AT_FDCWD, path, oflg);
+
+	fd = mnt_open_tree(AT_FDCWD, path, oflg,
+			mnt_context_is_restricted(cxt) ? RESOLVE_NO_SYMLINKS : 0);
 	mnt_context_syscall_save_status(cxt, "open_tree", fd >= 0);
 
 	return fd;
@@ -2050,7 +2223,22 @@ int mnt_context_prepare_srcpath(struct libmnt_context *cxt)
 		/*
 		 * Source is PATH (canonicalize)
 		 */
-		path = mnt_resolve_path(src, cache);
+		if (mnt_context_is_restricted(cxt)) {
+			/* In restricted mode, only canonicalize /dev/
+			 * paths (e.g. /dev/cdrom -> /dev/sr0) and verify
+			 * the result stays in /dev/. For non-/dev/ paths
+			 * (e.g. disk images in user dirs), keep the
+			 * original fstab path -- symlink protection is
+			 * handled at open time by RESOLVE_NO_SYMLINKS.
+			 */
+			if (ul_startswith(src, "/dev/")) {
+				path = mnt_resolve_path(src, cache);
+				if (path && !ul_startswith(path, "/dev/"))
+					path = NULL;
+			}
+		} else
+			path = mnt_resolve_path(src, cache);
+
 		if (path && strcmp(path, src) != 0)
 			rc = mnt_fs_set_source(cxt->fs, path);
 	 }
@@ -2165,17 +2353,6 @@ int mnt_context_guess_srcpath_fstype(struct libmnt_context *cxt, char **type)
 		}
 	}
 
-	if (rc == 0 && *type) {
-		const char *x = ul_fstype_to_mounttype(*type);
-
-		if (x) {
-			free(*type);
-			*type = strdup(x);
-			if (!*type)
-				rc = -ENOMEM;
-		}
-	}
-
 	return rc;
 }
 
@@ -2218,21 +2395,74 @@ int mnt_context_guess_fstype(struct libmnt_context *cxt)
 		goto done;
 
 	rc = mnt_context_guess_srcpath_fstype(cxt, &type);
-	if (rc == 0 && type)
+	if (rc == 0 && type) {
 		__mnt_fs_set_fstype_ptr(cxt->fs, type);
-	else
+		/* the type comes from the system, not from the user */
+		cxt->flags &= ~MNT_FL_FSTYPE_EXPLICIT;
+	} else
 		free(type);
 done:
-	DBG_OBJ(CXT, cxt, ul_debug("FS type: %s [rc=%d]",
-				mnt_fs_get_fstype(cxt->fs), rc));
+	DBG_OBJ(CXT, cxt, ul_debug("FS type: %s, mount type: %s [rc=%d]",
+				mnt_fs_get_fstype(cxt->fs),
+				mnt_context_get_mounttype(cxt), rc));
 	return rc;
 none:
 	return mnt_fs_set_fstype(cxt->fs, "none");
 }
 
 /*
+ * Returns 1 if the filesystem type has been requested by the user (by
+ * "-t <type>" or in fstab), and 0 if it comes from the system -- detected by
+ * libblkid/udev on mount, or reported by the kernel on umount.
+ *
+ * The mount configuration (fs.d/<type>.conf) is applied to the types provided
+ * by the system only, so that a type requested by the user is always used
+ * as-is. Note that the caller has to check that there is any type at all.
+ */
+int mnt_context_is_explicit_fstype(struct libmnt_context *cxt)
+{
+	return cxt->flags & MNT_FL_FSTYPE_EXPLICIT ? 1 : 0;
+}
+
+/*
+ * Returns the kernel filesystem driver name to use for the mount syscall.
+ *
+ * This is the filesystem type itself, unless the type comes from the system
+ * and the configuration maps it to another driver, for example
+ *
+ *	/etc/mount/fs.d/ntfs.conf:  mounttype = ntfs3
+ *
+ * Note that this is the driver name, it is not used to search for the
+ * /sbin/mount.<type> helper. See mnt_context_prepare_helper().
+ */
+const char *mnt_context_get_mounttype(struct libmnt_context *cxt)
+{
+	const char *type, *x;
+
+	if (!cxt || !cxt->fs)
+		return NULL;
+
+	type = mnt_fs_get_fstype(cxt->fs);
+	if (!type || mnt_context_is_explicit_fstype(cxt))
+		return type;
+
+	x = mnt_config_get_value(cxt, "fs.d", type, "mounttype");
+
+	return x ? x : type;
+}
+
+/*
  * The default is to use fstype from cxt->fs, this could be overwritten by
  * @type. The @act is MNT_ACT_{MOUNT,UMOUNT}.
+ *
+ * The name may be redirected by the configuration, for example
+ *
+ *	/etc/mount/fs.d/ntfs.conf:  helper = ntfs-3g
+ *
+ * makes mount(8) execute /sbin/mount.ntfs-3g for a detected "ntfs". The
+ * reserved name "none" means that no helper is used at all, so that the
+ * filesystem is mounted by the kernel driver even if /sbin/mount.<fstype>
+ * is installed.
  *
  * Returns: 0 on success or negative number in case of error. Note that success
  * does not mean that there is any usable helper, you have to check cxt->helper.
@@ -2261,6 +2491,19 @@ int mnt_context_prepare_helper(struct libmnt_context *cxt, const char *name,
 
 	if (type && strchr(type, ','))
 		return 0;			/* type is fstype pattern */
+
+	/* The configuration is keyed by the filesystem type we really have:
+	 * the type detected by libblkid/udev on mount, and the type reported
+	 * by the kernel on umount. */
+	if (type && !mnt_context_is_explicit_fstype(cxt)) {
+		const char *x = mnt_config_get_value(cxt, "fs.d", type, "helper");
+
+		if (x) {
+			DBG_OBJ(CXT, cxt, ul_debug("config: %s helper %s -> %s",
+						name, type, x));
+			type = x;
+		}
+	}
 
 	if (mnt_context_is_nohelpers(cxt)
 	    || !type
@@ -2515,8 +2758,12 @@ static int apply_fs(struct libmnt_context *cxt, struct libmnt_fs *fs, unsigned l
 	if (!rc)
 		rc = mnt_fs_set_target(cxt->fs, mnt_fs_get_target(fs));
 
-	if (!rc && !mnt_fs_get_fstype(cxt->fs))
+	if (!rc && !mnt_fs_get_fstype(cxt->fs) && mnt_fs_get_fstype(fs)) {
 		rc = mnt_fs_set_fstype(cxt->fs, mnt_fs_get_fstype(fs));
+		/* the type has been requested in fstab */
+		if (!rc)
+			cxt->flags |= MNT_FL_FSTYPE_EXPLICIT;
+	}
 
 	if (!rc && !mnt_fs_get_root(cxt->fs) && mnt_fs_get_root(fs))
 		rc = mnt_fs_set_root(cxt->fs, mnt_fs_get_root(fs));
@@ -3539,6 +3786,8 @@ struct libmnt_ns *mnt_context_switch_target_ns(struct libmnt_context *cxt)
 
 #ifdef TEST_PROGRAM
 
+#include <blkid.h>
+
 static int test_search_helper(struct libmnt_test *ts __attribute__((unused)),
 			      int argc, char *argv[])
 {
@@ -3567,6 +3816,70 @@ static int test_search_helper(struct libmnt_test *ts __attribute__((unused)),
 
 
 static struct libmnt_lock *lock;
+
+static unsigned int test_vfs_opens;
+static unsigned int test_vfs_closes;
+static unsigned int test_vfs_reads;
+static unsigned int test_vfs_writes;
+static unsigned int test_vfs_lseeks;
+
+static ssize_t test_vfs_read(int fd, void *buf, size_t count)
+{
+	test_vfs_reads++;
+	return read(fd, buf, count);
+}
+
+static ssize_t test_vfs_write(int fd, const void *buf, size_t count)
+{
+	test_vfs_writes++;
+	return write(fd, buf, count);
+}
+
+static int test_vfs_open(const char *pathname, int flags, mode_t mode)
+{
+	test_vfs_opens++;
+	return open(pathname, flags, mode);
+}
+
+static int test_vfs_close(int fd)
+{
+	test_vfs_closes++;
+	return close(fd);
+}
+
+static off_t test_vfs_lseek(int fd, off_t offset, int whence)
+{
+	test_vfs_lseeks++;
+	return lseek(fd, offset, whence);
+}
+
+static FILE *test_vfs_fopen(const char *pathname, const char *mode)
+{
+	fprintf(stderr, "VFS: fopen(\"%s\", \"%s\")\n", pathname, mode);
+	return fopen(pathname, mode);
+}
+
+static void test_vfs_dump_stats(void)
+{
+	fprintf(stderr, "VFS calls: open=%u close=%u read=%u write=%u lseek=%u\n",
+			test_vfs_opens, test_vfs_closes,
+			test_vfs_reads, test_vfs_writes, test_vfs_lseeks);
+}
+
+static int test_set_vfs(struct libmnt_context *cxt)
+{
+	struct ul_vfs_ops ops = {
+		.size      = sizeof(ops),
+		.vfs_read  = test_vfs_read,
+		.vfs_write = test_vfs_write,
+		.vfs_open  = test_vfs_open,
+		.vfs_close = test_vfs_close,
+		.vfs_lseek = test_vfs_lseek,
+		.vfs_fopen = test_vfs_fopen,
+	};
+
+	return mnt_context_set_vfs(cxt, &ops);
+}
 
 static void lock_fallback(void)
 {
@@ -3813,6 +4126,123 @@ static int test_mountall(struct libmnt_test *ts __attribute__((unused)),
 
 
 
+static int test_vfs(struct libmnt_test *ts __attribute__((unused)),
+		    int argc, char *argv[])
+{
+	int idx = 1, rc = 0;
+	struct libmnt_context *cxt;
+	struct libmnt_table *tb = NULL;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+
+	test_set_vfs(cxt);
+
+	if (idx < argc && !strcmp(argv[idx], "--table")) {
+		idx++;
+		if (idx >= argc) {
+			rc = -EINVAL;
+			goto done;
+		}
+		rc = mnt_context_get_table(cxt, argv[idx++], &tb);
+		if (rc) {
+			warn("failed to parse table");
+			goto done;
+		}
+		printf("table: parsed %d entries\n",
+				mnt_table_get_nents(tb));
+		mnt_unref_table(tb);
+	}
+
+	if (idx < argc && !strcmp(argv[idx], "--cache")) {
+		struct libmnt_cache *cache;
+		char *type;
+
+		idx++;
+		if (idx >= argc) {
+			rc = -EINVAL;
+			goto done;
+		}
+		cache = mnt_context_get_cache(cxt);
+		if (!cache) {
+			warnx("no cache");
+			rc = -ENOMEM;
+			goto done;
+		}
+		rc = mnt_cache_read_tags(cache, argv[idx]);
+		if (rc < 0) {
+			warn("failed to read tags for %s", argv[idx]);
+			goto done;
+		}
+		type = mnt_get_fstype(argv[idx], NULL, cache);
+		printf("cache: %s type=%s\n", argv[idx], type ? type : "unknown");
+		idx++;
+	}
+
+	if (idx < argc && !strcmp(argv[idx], "--blkid")) {
+		blkid_probe pr;
+		const char *data;
+
+		idx++;
+		if (idx >= argc) {
+			rc = -EINVAL;
+			goto done;
+		}
+		pr = blkid_new_probe();
+		if (!pr) {
+			rc = -ENOMEM;
+			goto done;
+		}
+		blkid_probe_set_vfs(pr, cxt->vfs);
+		if (blkid_probe_open_device(pr, argv[idx], 0)) {
+			warn("failed to open %s", argv[idx]);
+			blkid_free_probe(pr);
+			rc = -errno;
+			goto done;
+		}
+		blkid_probe_enable_superblocks(pr, 1);
+		blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_TYPE);
+
+		rc = blkid_do_safeprobe(pr);
+		if (!rc && !blkid_probe_lookup_value(pr, "TYPE", &data, NULL))
+			printf("blkid: %s type=%s\n", argv[idx], data);
+		else
+			printf("blkid: %s type=unknown\n", argv[idx]);
+
+		blkid_free_probe(pr);
+		idx++;
+		rc = 0;
+	}
+
+done:
+	test_vfs_dump_stats();
+	mnt_free_context(cxt);
+	return rc;
+}
+
+static int test_restricted(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[] __attribute__((unused)))
+{
+	struct libmnt_context *cxt;
+
+	if (argc != 1)
+		return -EINVAL;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+
+	printf("default: %d\n", mnt_context_is_restricted(cxt));
+	mnt_context_set_restricted(cxt, 1);
+	printf("restricted: %d\n", mnt_context_is_restricted(cxt));
+	mnt_context_set_restricted(cxt, 0);
+	printf("unrestricted: %d\n", mnt_context_is_restricted(cxt));
+
+	mnt_free_context(cxt);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct libmnt_test tss[] = {
@@ -3822,6 +4252,8 @@ int main(int argc, char *argv[])
 	{ "--flags", test_flags,   "[-o <opts>] <spec>" },
 	{ "--cxtsync", test_cxtsync, "<fsopts> <cxtopts> <fsopts>" },
 	{ "--search-helper", test_search_helper, "<fstype>" },
+	{ "--restricted", test_restricted, "" },
+	{ "--vfs", test_vfs, "[--table <file>] [--cache <dev>] [--blkid <dev>]" },
 	{ NULL }};
 
 	umask(S_IWGRP|S_IWOTH);	/* to be compatible with mount(8) */

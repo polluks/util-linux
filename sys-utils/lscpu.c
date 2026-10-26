@@ -910,7 +910,7 @@ print_summary_cputype(struct lscpu_cxt *cxt,
 	if (ct->family)
 		add_summary_s(tb, sec, _("CPU family:"), ct->family);
 	if (ct->model || ct->revision)
-		add_summary_s(tb, sec, _("Model:"), ct->revision ? ct->revision : ct->model);
+		add_summary_s(tb, sec, _("Model:"), ct->model ?: ct->revision);
 
 	add_summary_n(tb, sec, _("Thread(s) per core:"), ct->nthreads_per_core);
 	if (cxt->is_cluster)
@@ -975,13 +975,12 @@ print_summary_cputype(struct lscpu_cxt *cxt,
 	if (ct->flags)
 		add_summary_s(tb, sec, _("Flags:"), ct->flags);
 
-	if (ct->isa && is_riscv(ct)) {
+	if (is_riscv(ct)) {
 		lscpu_format_isa_riscv(ct);
 		add_summary_s(tb, sec, _("ISA:"), ct->isa);
+		if (ct->mmu)
+			add_summary_s(tb, sec, _("MMU:"), ct->mmu);
 	}
-
-	if (ct->mmu && is_riscv(ct))
-		add_summary_s(tb, sec, _("MMU:"), ct->mmu);
 }
 
 /*

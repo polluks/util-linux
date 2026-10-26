@@ -19,6 +19,7 @@
 #include "cctype.h"
 #include "nls.h"
 #include "strutils.h"
+#include "timeutils.h"
 #include "bitops.h"
 #include "pathnames.h"
 
@@ -61,7 +62,7 @@ static int do_scale_by_power (uintmax_t *x, int base, int power)
  *
  * The function also supports decimal point, for example:
  *              0.5MB   = 500000
- *              0.5MiB  = 512000
+ *              0.5MiB  = 524288
  *
  * Note that the function does not accept numbers with '-' (negative sign)
  * prefix.
@@ -164,53 +165,41 @@ check_suffix:
 		}
 	}
 
-	rc = do_scale_by_power(&x, base, pwr);
 	if (power)
 		*power = pwr;
+
+	rc = do_scale_by_power(&x, base, pwr);
+	if (rc)
+		goto err;
+
 	if (frac && pwr) {
 		int i;
-		uintmax_t frac_div = 10, frac_poz = 1, frac_base = 1;
+		uintmax_t frac_base = 1, frac_val = 0;
 
 		/* mega, giga, ... */
-		do_scale_by_power(&frac_base, base, pwr);
-
-		/* maximal divisor for last digit (e.g. for 0.05 is
-		 * frac_div=100, for 0.054 is frac_div=1000, etc.)
-		 *
-		 * Reduce frac if too large.
-		 */
-		while (frac_div < frac) {
-			if (frac_div <= UINTMAX_MAX/10)
-				frac_div *= 10;
-			else
-				frac /= 10;
-		}
-
-		/* 'frac' is without zeros (5 means 0.5 as well as 0.05) */
-		for (i = 0; i < frac_zeros; i++) {
-			if (frac_div <= UINTMAX_MAX/10)
-				frac_div *= 10;
-			else
-				frac /= 10;
-		}
+		rc = do_scale_by_power(&frac_base, base, pwr);
+		if (rc)
+			goto err;
 
 		/*
-		 * Go backwardly from last digit and add to result what the
-		 * digit represents in the frac_base. For example 0.25G
-		 *
-		 *  5 means 1GiB / (100/5)
-		 *  2 means 1GiB / (10/2)
+		 * Go backwardly from last digit and compute frac_base * 0.<frac>
+		 * rounded down. For example 0.25G is (5G / 10 + 2G) / 10.
+		 * The intermediate value is always smaller than 10 * frac_base.
 		 */
 		do {
-			unsigned int seg = frac % 10;		 /* last digit of the frac */
-			uintmax_t seg_div = frac_div / frac_poz; /* what represents the segment 1000, 100, .. */
-
-			frac /= 10;	/* remove last digit from frac */
-			frac_poz *= 10;
-
-			if (seg && seg_div / seg)
-				x += frac_base / (seg_div / seg);
+			frac_val = ((frac % 10) * frac_base + frac_val) / 10;
+			frac /= 10;
 		} while (frac);
+
+		/* 'frac' is without zeros (5 means 0.5 as well as 0.05) */
+		for (i = 0; i < frac_zeros && frac_val; i++)
+			frac_val /= 10;
+
+		if (UINTMAX_MAX - x < frac_val) {
+			rc = -ERANGE;
+			goto err;
+		}
+		x += frac_val;
 	}
 done:
 	*res = x;
@@ -547,7 +536,7 @@ void strtotimeval_or_err(const char *str, struct timeval *tv, const char *errmes
 
 	user_input = strtold_or_err(str, errmesg);
 	tv->tv_sec = (time_t) user_input;
-	tv->tv_usec = (suseconds_t)((user_input - tv->tv_sec) * 1000000);
+	tv->tv_usec = (suseconds_t)((user_input - tv->tv_sec) * USEC_PER_SEC);
 }
 
 void strtotimespec_or_err(const char *str, struct timespec *ts, const char *errmesg)
@@ -556,7 +545,7 @@ void strtotimespec_or_err(const char *str, struct timespec *ts, const char *errm
 
 	user_input = strtold_or_err(str, errmesg);
 	ts->tv_sec = (time_t) user_input;
-	ts->tv_nsec = (long)((user_input - ts->tv_sec) * 1000000000);
+	ts->tv_nsec = (long)((user_input - ts->tv_sec) * NSEC_PER_SEC);
 }
 
 time_t strtotime_or_err(const char *str, const char *errmesg)
@@ -955,7 +944,7 @@ int ul_parse_range(const char *str, int *lower, int *upper, int def)
 	return 0;
 }
 
-static const char *next_path_segment(const char *str, size_t *sz)
+const char *ul_path_next_segment(const char *str, size_t *sz)
 {
 	const char *start, *p;
 
@@ -978,8 +967,8 @@ int streq_paths(const char *a, const char *b)
 {
 	while (a && b) {
 		size_t a_sz, b_sz;
-		const char *a_seg = next_path_segment(a, &a_sz);
-		const char *b_seg = next_path_segment(b, &b_sz);
+		const char *a_seg = ul_path_next_segment(a, &a_sz);
+		const char *b_seg = ul_path_next_segment(b, &b_sz);
 
 		/*
 		fprintf(stderr, "A>>>(%zu) '%s'\n", a_sz, a_seg);
@@ -1003,6 +992,33 @@ int streq_paths(const char *a, const char *b)
 		a = a_seg + a_sz;
 		b = b_seg + b_sz;
 	};
+
+	return 0;
+}
+
+/* Returns 1 if @path is @dir or a path below @dir, compared like streq_paths() */
+int ul_path_is_within(const char *path, const char *dir)
+{
+	if (!path || !dir || !*path || !*dir)
+		return 0;
+
+	while (path && dir) {
+		size_t p_sz, d_sz;
+		const char *p_seg = ul_path_next_segment(path, &p_sz);
+		const char *d_seg = ul_path_next_segment(dir, &d_sz);
+
+		/* all @dir segments matched */
+		if (d_sz == 0 || (d_sz == 1 && d_seg && *d_seg == '/'))
+			return 1;
+
+		if (!p_seg || !d_seg)
+			break;
+		if (p_sz != d_sz || strncmp(p_seg, d_seg, p_sz) != 0)
+			break;
+
+		path = p_seg + p_sz;
+		dir = d_seg + d_sz;
+	}
 
 	return 0;
 }
@@ -1353,6 +1369,29 @@ char *ul_optstr_get_value(const char *optstr, const char *key)
 	return NULL;
 }
 
+/* Removes one pair of matching surrounding quotes ('' or "") from @str.
+ *
+ * Returns size of the new string (without \0).
+ */
+size_t ul_unquote(char *str)
+{
+	size_t len;
+	char q;
+
+	if (!str || !*str)
+		return 0;
+
+	len = strlen(str);
+	q = *str;
+
+	if ((q != '"' && q != '\'') || len < 2 || str[len - 1] != q)
+		return len;
+
+	memmove(str, str + 1, len - 2);
+	str[len - 2] = '\0';
+	return len - 2;
+}
+
 #ifdef TEST_PROGRAM_STRUTILS
 
 struct testS {
@@ -1420,6 +1459,19 @@ static int test_strutils_cmp_paths(int argc, char *argv[])
 		return EXIT_FAILURE;
 
 	printf("%s: '%s' '%s'\n", rc == 1 ? "YES" : "NOT", argv[1], argv[2]);
+	return EXIT_SUCCESS;
+}
+
+static int test_strutils_path_is_within(int argc, char *argv[])
+{
+	int rc;
+
+	if (argc < 3)
+		return EXIT_FAILURE;
+
+	rc = ul_path_is_within(argv[1], argv[2]);
+
+	printf("%s: '%s' within '%s'\n", rc == 1 ? "YES" : "NOT", argv[1], argv[2]);
 	return EXIT_SUCCESS;
 }
 
@@ -1498,6 +1550,9 @@ int main(int argc, char *argv[])
 	} else if (argc == 4 && strcmp(argv[1], "--cmp-paths") == 0) {
 		return test_strutils_cmp_paths(argc - 1, argv + 1);
 
+	} else if (argc == 4 && strcmp(argv[1], "--path-is-within") == 0) {
+		return test_strutils_path_is_within(argc - 1, argv + 1);
+
 	} else if (argc == 4 && strcmp(argv[1], "--strdup-member") == 0) {
 		return test_strdup_to_member(argc - 1, argv + 1);
 
@@ -1562,17 +1617,31 @@ int main(int argc, char *argv[])
 		}
 		if (rc == 1)
 			return EXIT_SUCCESS;
+	} else if (argc == 3 && strcmp(argv[1], "--unquote") == 0) {
+
+		char *unquoted = strdup(argv[2]);
+
+		if (!unquoted)
+			err(EXIT_FAILURE, "strdup() failed");
+
+		ul_unquote(unquoted);
+		printf("%s-->%s\n", argv[2], unquoted);
+		free(unquoted);
+		return EXIT_SUCCESS;
+
 	} else {
 		fprintf(stderr, "usage: %1$s --size <number>[suffix]\n"
 				"       %1$s --strtobool <str>\n"
 				"       %1$s --parse-switch <str>\n"
 				"       %1$s --cmp-paths <path> <path>\n"
+				"       %1$s --path-is-within <path> <dir>\n"
 				"       %1$s --strdup-member <str> <str>\n"
 				"       %1$s --stralnumcmp <str> <str>\n"
 				"       %1$s --cstrcasecmp <str> <str>\n"
 				"       %1$s --normalize <str>\n"
 				"       %1$s --strto{s,u}{16,32,64} <str>\n"
-				"       %1$s --optstr <str>\n",
+				"       %1$s --optstr <str>\n"
+				"       %1$s --unquote <str>\n",
 				argv[0]);
 		exit(EXIT_FAILURE);
 	}

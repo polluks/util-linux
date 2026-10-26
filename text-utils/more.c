@@ -223,6 +223,7 @@ struct more_control {
 		is_eof,                 /* EOF detected */
 		is_paused,  		/* is output paused */
 		is_secure,		/* is running in secure mode */
+		no_eol,			/* last byte written to stdout was not \n */
 		no_quit_dialog,  	/* suppress quit dialog */
 		no_scroll,  		/* do not scroll, clear the screen and then display text */
 		no_tty_in,  		/* is input in interactive mode */
@@ -416,12 +417,12 @@ static int check_magic(struct more_control *ctl, char *fs)
 	const char *magic_error_msg = magic_error(ctl->magic);
 
 	if (magic_error_msg) {
-		printf("%s: %s: %s\n", program_invocation_short_name,
-			_("magic failed"), magic_error_msg);
+		warnx("%s: %s", _("magic failed"), magic_error_msg);
 		return 0;
 	}
 	if (!mime_encoding || !(strcmp("binary", mime_encoding))) {
 		printf(_("\n******** %s: Not a text file ********\n\n"), fs);
+		ctl->no_eol = 0;
 		return 1;
 	}
 #else
@@ -442,6 +443,7 @@ static int check_magic(struct more_control *ctl, char *fs)
 		case 0x457f:	/* simple ELF detection */
 			printf(_("\n******** %s: Not a text file ********\n\n"),
 			       fs);
+			ctl->no_eol = 0;
 			return 1;
 		}
 	}
@@ -462,7 +464,7 @@ static void checkf(struct more_control *ctl, char *fs)
 	ctl->file_size = 0;
 	fflush(NULL);
 
-	ctl->current_file = fopen(fs, "r");
+	ctl->current_file = fopen(fs, "r" UL_CLOEXECSTR);
 	if (ctl->current_file == NULL) {
 		if (ctl->clear_line_ends)
 			putp(ctl->erase_line);
@@ -471,23 +473,25 @@ static void checkf(struct more_control *ctl, char *fs)
 	}
 	if (fstat(fileno(ctl->current_file), &st) != 0) {
 		warn(_("stat of %s failed"), fs);
-		return;
+		goto fail;
 	}
 	if ((st.st_mode & S_IFMT) == S_IFDIR) {
 		printf(_("\n*** %s: directory ***\n\n"), fs);
-		ctl->current_file = NULL;
-		return;
+		ctl->no_eol = 0;
+		goto fail;
 	}
 	ctl->file_size = st.st_size;
-	if (0 < ctl->file_size && check_magic(ctl, fs)) {
-		fclose(ctl->current_file);
-		ctl->current_file = NULL;
-		return;
-	}
+	if (0 < ctl->file_size && check_magic(ctl, fs))
+		goto fail;
+
 	fcntl(fileno(ctl->current_file), F_SETFD, FD_CLOEXEC);
 	c = more_getc(ctl);
 	ctl->clear_first = (c == '\f');
 	more_ungetc(ctl, c);
+	return;
+fail:
+	fclose(ctl->current_file);
+	ctl->current_file = NULL;
 }
 
 static void prepare_line_buffer(struct more_control *ctl)
@@ -551,6 +555,8 @@ static int get_line(struct more_control *ctl, int *length)
 				break;
 
 			case (size_t)-1:	/* Invalid as a multibyte character. */
+				if (p >= &ctl->line_buf[ctl->line_sz - 1])
+					break;
 				*p++ = mbc[0];
 				state = state_bak;
 				column++;
@@ -1968,13 +1974,19 @@ static void screen(struct more_control *ctl, int num_lines)
 	}
 }
 
-static void copy_file(FILE *f)
+/*
+ * Copy the file to stdout and keep track of whether the output ended
+ * without a trailing newline.
+ */
+static void copy_file(struct more_control *ctl, FILE *f)
 {
 	char buf[BUFSIZ];
 	size_t sz;
 
-	while ((sz = fread(&buf, sizeof(char), sizeof(buf), f)) > 0)
+	while ((sz = fread(&buf, sizeof(char), sizeof(buf), f)) > 0) {
 		fwrite(&buf, sizeof(char), sz, stdout);
+		ctl->no_eol = buf[sz - 1] != '\n';
+	}
 }
 
 
@@ -2005,6 +2017,10 @@ static void display_file(struct more_control *ctl, int left)
 				more_clear_screen(ctl);
 		}
 		if (ctl->print_banner) {
+			/* the banner has to start on a new line */
+			if (ctl->no_eol)
+				putchar('\n');
+			ctl->no_eol = 0;
 			if (ctl->bad_stdout)
 				erase_to_col(ctl, 0);
 			if (ctl->clear_line_ends)
@@ -2024,7 +2040,7 @@ static void display_file(struct more_control *ctl, int left)
 				left = ctl->lines_per_page - 4;
 		}
 		if (ctl->no_tty_out)
-			copy_file(ctl->current_file);
+			copy_file(ctl, ctl->current_file);
 		else
 			screen(ctl, left);
 	}
@@ -2190,8 +2206,6 @@ int main(int argc, char **argv)
 	}
 
 	left = ctl.lines_per_screen;
-	if (ctl.num_files > 1)
-		ctl.print_banner = 1;
 	if (!ctl.no_tty_in && ctl.num_files == 0) {
 		warnx(_("bad usage"));
 		errtryhelp(EXIT_FAILURE);
@@ -2213,7 +2227,7 @@ int main(int argc, char **argv)
 	ctl.sigfd = signalfd(-1, &ctl.sigset, SFD_CLOEXEC);
 	if (ctl.no_tty_in) {
 		if (ctl.no_tty_out)
-			copy_file(stdin);
+			copy_file(&ctl, stdin);
 		else {
 			ctl.current_file = stdin;
 			display_file(&ctl, left);
@@ -2222,6 +2236,8 @@ int main(int argc, char **argv)
 		ctl.print_banner = 1;
 		ctl.first_file = 0;
 	}
+	if (ctl.num_files > 1)
+		ctl.print_banner = 1;
 
 	while (ctl.argv_position < ctl.num_files) {
 		checkf(&ctl, ctl.file_names[ctl.argv_position]);

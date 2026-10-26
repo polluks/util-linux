@@ -954,7 +954,7 @@ static size_t skip_empty(const unsigned char *buf, size_t i, size_t sz)
 	size_t next;
 	const unsigned char *p0 = buf + i;
 
-	for (next = i + 16; next < sz; next += 16) {
+	for (next = i + 16; next + 16 <= sz; next += 16) {
 		if (memcmp(p0, buf + next, 16) != 0)
 			break;
 	}
@@ -1006,7 +1006,7 @@ static void dump_blkdev(struct fdisk_context *cxt, const char *name,
 	else {
 		unsigned char *buf = xmalloc(size);
 
-		if (read_all(fd, (char *) buf, size) != (ssize_t) size)
+		if (ul_read_all(fd, (char *) buf, size) != (ssize_t) size)
 			fdisk_warn(cxt, _("cannot read"));
 		else
 			dump_buffer(offset, buf, size);
@@ -1041,7 +1041,7 @@ static fdisk_sector_t get_dev_blocks(char *dev)
 
 	if ((fd = open(dev, O_RDONLY|O_NONBLOCK)) < 0)
 		err(EXIT_FAILURE, _("cannot open %s"), dev);
-	ret = blkdev_get_sectors(fd, (unsigned long long *) &size);
+	ret = blkdev_get_sectors(fd, &size);
 	close(fd);
 	if (ret < 0)
 		err(EXIT_FAILURE, _("BLKGETSIZE ioctl failed on %s"), dev);
@@ -1149,6 +1149,7 @@ int main(int argc, char **argv)
 	struct fdisk_context *cxt;
 	char *outarg = NULL;
 	const char *devname, *lockmode = NULL;
+	const char *wanted_label = NULL;
 	enum {
 		OPT_BYTES	= CHAR_MAX + 1,
 		OPT_LOCK
@@ -1274,6 +1275,7 @@ int main(int argc, char **argv)
 			if (!lb)
 				errx(EXIT_FAILURE, _("unsupported disklabel: %s"), optarg);
 			fdisk_label_set_disabled(lb, 0);
+			wanted_label = fdisk_label_get_name(lb);
 			break;
 		}
 		case 'u':
@@ -1401,8 +1403,15 @@ int main(int argc, char **argv)
 
 		if (!fdisk_has_label(cxt)) {
 			fdisk_info(cxt, _("Device does not contain a recognized partition table."));
-			if (!noauto_pt)
-				fdisk_create_disklabel(cxt, NULL);
+			if (!noauto_pt) {
+				if (is_interactive && !wanted_label)
+					rc = fdisk_create_disklabel(cxt, fdisk_get_recommended_labelname());
+				else
+					rc = fdisk_create_disklabel(cxt, wanted_label);
+
+				if (rc)
+					fdisk_warn(cxt, _("Failed to create a disklabel."));
+			}
 
 		} else if (fdisk_is_label(cxt, GPT) && fdisk_gpt_is_hybrid(cxt))
 			fdisk_warnx(cxt, _(

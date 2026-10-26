@@ -30,6 +30,9 @@
 #include "lsfd.h"
 #include "pidfd.h"
 
+#include "xalloc.h"
+#include "buffer.h"
+
 #define offsetofend(TYPE, MEMBER)				\
 	(offsetof(TYPE, MEMBER)	+ sizeof_member(TYPE, MEMBER))
 
@@ -334,12 +337,10 @@ static int anon_eventfd_handle_fdinfo(struct unkn *unkn, const char *key, const 
 	return 0;
 }
 
-static inline char *anon_eventfd_data_xstrendpoint(struct file *file)
+static inline void anon_eventfd_data_xbufendpoint(struct file *file, struct ul_buffer *ul_buf)
 {
-	char *str = NULL;
-	xasprintf(&str, "%d,%s,%d",
-		  file->proc->pid, file->proc->command, file->association);
-	return str;
+	ul_buffer_xappendf(ul_buf, "%d,%s,%d",
+			   file->proc->pid, file->proc->command, file->association);
 }
 
 static bool anon_eventfd_fill_column(struct proc *proc  __attribute__((__unused__)),
@@ -357,22 +358,19 @@ static bool anon_eventfd_fill_column(struct proc *proc  __attribute__((__unused_
 		return true;
 	case COL_ENDPOINTS: {
 		struct list_head *e;
-		char *estr;
+		struct ul_buffer ul_buf = UL_INIT_BUFFER;
 		foreach_endpoint(e, data->endpoint) {
 			struct anon_eventfd_data *other = list_entry(e,
 								     struct anon_eventfd_data,
 								     endpoint.endpoints);
 			if (data == other)
 				continue;
-			if (*str)
-				xstrputc(str, '\n');
-			estr = anon_eventfd_data_xstrendpoint(&other->backptr->file);
-			xstrappend(str, estr);
-			free(estr);
+			if (!ul_buffer_is_empty(&ul_buf))
+				ul_buffer_xappend_char(&ul_buf, '\n');
+			anon_eventfd_data_xbufendpoint(&other->backptr->file, &ul_buf);
 		}
-		if (!*str)
-			return false;
-		return true;
+		*str = ul_buffer_steal_string(&ul_buf);
+		return *str ? true : false;
 	}
 	default:
 		return false;
@@ -462,20 +460,16 @@ static char *anon_eventpoll_make_tfds_string(struct anon_eventpoll_data *data,
 					     const char *prefix,
 					     const char sep)
 {
-	char *str = prefix? xstrdup(prefix): NULL;
+	struct ul_buffer ul_buf = UL_INIT_BUFFER;
 
-	char buf[256];
+	if (prefix)
+		ul_buffer_xappend_string(&ul_buf, prefix);
 	for (size_t i = 0; i < data->count; i++) {
-		size_t offset = 0;
-
-		if (i > 0) {
-			buf[0] = sep;
-			offset = 1;
-		}
-		snprintf(buf + offset, sizeof(buf) - offset, "%d", data->tfds[i]);
-		xstrappend(&str, buf);
+		if (i > 0)
+			ul_buffer_xappend_char(&ul_buf, sep);
+		ul_buffer_xappendf(&ul_buf, "%d", data->tfds[i]);
 	}
-	return str;
+	return ul_buffer_steal_string(&ul_buf);
 }
 
 static char *anon_eventpoll_get_name(struct unkn *unkn)
@@ -495,7 +489,7 @@ static bool anon_eventpoll_fill_column(struct proc *proc  __attribute__((__unuse
 
 	switch(column_id) {
 	case COL_EVENTPOLL_TFDS:
-		*str =anon_eventpoll_make_tfds_string(data, NULL, '\n');
+		*str = anon_eventpoll_make_tfds_string(data, NULL, '\n');
 		if (*str)
 			return true;
 		break;
@@ -731,29 +725,26 @@ static int anon_signalfd_handle_fdinfo(struct unkn *unkn, const char *key, const
 
 static char *anon_signalfd_make_mask_string(const char* prefix, uint64_t sigmask)
 {
-	char *str = NULL;
+	struct ul_buffer ul_buf = UL_INIT_BUFFER;
 
 	for (size_t i = 0; i < sizeof(sigmask) * 8; i++) {
 		if ((((uint64_t)0x1) << i) & sigmask) {
 			const int signum = i + 1;
 			const char *signame = signum_to_signame(signum);
 
-			if (str)
-				xstrappend(&str, ",");
+			if (!ul_buffer_is_empty(&ul_buf))
+				ul_buffer_xappend_char(&ul_buf, ',');
 			else if (prefix)
-				xstrappend(&str, prefix);
+				ul_buffer_xappend_string(&ul_buf, prefix);
 
-			if (signame) {
-				xstrappend(&str, signame);
-			} else {
-				char buf[BUFSIZ];
-				snprintf(buf, sizeof(buf), "%d", signum);
-				xstrappend(&str, buf);
-			}
+			if (signame)
+				ul_buffer_xappend_string(&ul_buf, signame);
+			else
+				ul_buffer_xappendf(&ul_buf, "%d", signum);
 		}
 	}
 
-	return str;
+	return ul_buffer_steal_string(&ul_buf);
 }
 
 static char *anon_signalfd_get_name(struct unkn *unkn)
@@ -823,9 +814,8 @@ static char *anon_inotify_make_inodes_string(const char *prefix,
 					     enum decode_source_level decode_level,
 					     struct anon_inotify_data *data)
 {
-	char *str = NULL;
 	char buf[BUFSIZ] = {'\0'};
-	bool first_element = true;
+	struct ul_buffer ul_buf = UL_INIT_BUFFER;
 
 	struct list_head *i;
 	list_for_each(i, &data->inodes) {
@@ -833,18 +823,19 @@ static char *anon_inotify_make_inodes_string(const char *prefix,
 		struct anon_inotify_inode *inode = list_entry(i,
 							      struct anon_inotify_inode,
 							      inodes);
+		ul_buffer_xappend_string(&ul_buf,
+					 ul_buffer_is_empty(&ul_buf) ? prefix : sep);
 
 		decode_source(source, sizeof(source),
 			      ANON_INOTIFY_MAJOR(inode->sdev), ANON_INOTIFY_MINOR(inode->sdev),
 			      decode_level);
-		snprintf(buf, sizeof(buf), "%s%llu@%s", first_element? prefix: sep,
+		snprintf(buf, sizeof(buf), "%llu@%s",
 			 (unsigned long long)inode->ino, source);
-		first_element = false;
 
-		xstrappend(&str, buf);
+		ul_buffer_xappend_string(&ul_buf, buf);
 	}
 
-	return str;
+	return ul_buffer_steal_string(&ul_buf);
 }
 
 static char *anon_inotify_get_name(struct unkn *unkn)
@@ -888,7 +879,7 @@ static int anon_inotify_handle_fdinfo(struct unkn *unkn, const char *key, const 
 		unsigned long long ino;
 		unsigned long long sdev;
 
-		if (sscanf(value, "%*d ino:%llx sdev:%llx %*s", &ino, &sdev) == 2) {
+		if (sscanf(value, "%*x ino:%llx sdev:%llx %*s", &ino, &sdev) == 2) {
 			add_inode(data, (ino_t)ino, (dev_t)sdev);
 			return 1;
 		}
@@ -1179,6 +1170,7 @@ struct anon_bpf_map_data {
 	int type;
 	int id;
 	char name[BPF_OBJ_NAME_LEN + 1];
+	bool has_data;		/* true if fdinfo was parsed */
 };
 
 static bool anon_bpf_map_probe(const char *str)
@@ -1202,6 +1194,9 @@ static bool anon_bpf_map_fill_column(struct proc *proc  __attribute__((__unused_
 {
 	struct anon_bpf_map_data *data = (struct anon_bpf_map_data *)unkn->anon_data;
 	const char *t;
+
+	if (!data->has_data)
+		return false;
 
 	switch(column_id) {
 	case COL_BPF_MAP_ID:
@@ -1231,6 +1226,9 @@ static char *anon_bpf_map_get_name(struct unkn *unkn)
 	char *str = NULL;
 	struct anon_bpf_map_data *data = (struct anon_bpf_map_data *)unkn->anon_data;
 
+	if (!data->has_data)
+		return NULL;
+
 	t = anon_bpf_map_get_map_type_name(data->type);
 	if (t)
 		xasprintf(&str, "id=%d type=%s", data->id, t);
@@ -1249,6 +1247,7 @@ static void anon_bpf_map_init(struct unkn *unkn)
 	data->type = -1;
 	data->id = -1;
 	data->name[0] = '\0';
+	data->has_data = false;
 	unkn->anon_data = data;
 }
 
@@ -1292,6 +1291,7 @@ static int anon_bpf_map_handle_fdinfo(struct unkn *unkn, const char *key, const 
 		if (rc < 0)
 			return 0; /* ignore -- parse failed */
 		((struct anon_bpf_map_data *)unkn->anon_data)->id = (int)t;
+		((struct anon_bpf_map_data *)unkn->anon_data)->has_data = true;
 		anon_bpf_map_get_more_info((struct anon_bpf_map_data *)unkn->anon_data);
 		return 1;
 	}
@@ -1319,6 +1319,363 @@ static const struct anon_ops anon_bpf_map_ops = {
 };
 
 /*
+ * bpf-link
+ */
+static const char *const bpf_link_type_table[] = {
+	[0]  = "unspec",		/* BPF_LINK_TYPE_UNSPEC */
+	[1]  = "raw_tracepoint",	/* BPF_LINK_TYPE_RAW_TRACEPOINT */
+	[2]  = "tracing",		/* BPF_LINK_TYPE_TRACING */
+	[3]  = "cgroup",		/* BPF_LINK_TYPE_CGROUP */
+	[4]  = "iter",			/* BPF_LINK_TYPE_ITER */
+	[5]  = "netns",			/* BPF_LINK_TYPE_NETNS */
+	[6]  = "xdp",			/* BPF_LINK_TYPE_XDP */
+	[7]  = "perf_event",		/* BPF_LINK_TYPE_PERF_EVENT */
+	[8]  = "kprobe_multi",		/* BPF_LINK_TYPE_KPROBE_MULTI */
+	[9]  = "struct_ops",		/* BPF_LINK_TYPE_STRUCT_OPS */
+	[10] = "netfilter",		/* BPF_LINK_TYPE_NETFILTER */
+	[11] = "tcx",			/* BPF_LINK_TYPE_TCX */
+	[12] = "uprobe_multi",		/* BPF_LINK_TYPE_UPROBE_MULTI */
+	[13] = "netkit",		/* BPF_LINK_TYPE_NETKIT */
+	[14] = "sockmap",		/* BPF_LINK_TYPE_SOCKMAP */
+};
+
+struct anon_bpf_link_data {
+	int id;
+	int prog_id;
+	char *type_str;		/* "link_type" string from fdinfo */
+};
+
+static bool anon_bpf_link_probe(const char *str)
+{
+	return strncmp(str, "bpf_link", 8) == 0;
+}
+
+static int anon_bpf_link_type_name_to_id(const char *name)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(bpf_link_type_table); i++)
+		if (bpf_link_type_table[i]
+		    && strcmp(bpf_link_type_table[i], name) == 0)
+			return (int)i;
+	return -1;
+}
+
+static bool anon_bpf_link_fill_column(struct proc *proc  __attribute__((__unused__)),
+				      struct unkn *unkn,
+				      struct libscols_line *ln __attribute__((__unused__)),
+				      int column_id,
+				      size_t column_index __attribute__((__unused__)),
+				      char **str)
+{
+	struct anon_bpf_link_data *data = (struct anon_bpf_link_data *)unkn->anon_data;
+	int t;
+
+	switch(column_id) {
+	case COL_BPF_LINK_ID:
+		if (data->id >= 0)
+			xasprintf(str, "%d", data->id);
+		return true;
+	case COL_BPF_LINK_TYPE_RAW:
+		if (data->type_str && data->type_str[0]) {
+			t = anon_bpf_link_type_name_to_id(data->type_str);
+			if (t >= 0)
+				xasprintf(str, "%d", t);
+		}
+		return true;
+	case COL_BPF_LINK_TYPE:
+		if (data->type_str && data->type_str[0])
+			*str = xstrdup(data->type_str);
+		return true;
+	case COL_BPF_LINK_PROG_ID:
+		if (data->prog_id >= 0)
+			xasprintf(str, "%d", data->prog_id);
+		return true;
+	default:
+		return false;
+	}
+}
+
+static char *anon_bpf_link_get_name(struct unkn *unkn)
+{
+	char *str = NULL;
+	struct anon_bpf_link_data *data = (struct anon_bpf_link_data *)unkn->anon_data;
+
+	if (data->type_str && data->type_str[0])
+		xasprintf(&str, "id=%d type=%s", data->id, data->type_str);
+	else
+		xasprintf(&str, "id=%d", data->id);
+
+	if (data->prog_id >= 0)
+		xstrfappend(&str, " prog=%d", data->prog_id);
+
+	return str;
+}
+
+static void anon_bpf_link_init(struct unkn *unkn)
+{
+	struct anon_bpf_link_data *data = xmalloc(sizeof(*data));
+	data->id = -1;
+	data->prog_id = -1;
+	data->type_str = NULL;
+	unkn->anon_data = data;
+}
+
+static void anon_bpf_link_free(struct unkn *unkn)
+{
+	struct anon_bpf_link_data *data = (struct anon_bpf_link_data *)unkn->anon_data;
+	free(data->type_str);
+	free(data);
+}
+
+static int anon_bpf_link_handle_fdinfo(struct unkn *unkn, const char *key, const char *value)
+{
+	if (strcmp(key, "link_id") == 0) {
+		int32_t t = -1;
+		int rc = ul_strtos32(value, &t, 10);
+		if (rc < 0)
+			return 0; /* ignore -- parse failed */
+		((struct anon_bpf_link_data *)unkn->anon_data)->id = (int)t;
+		return 1;
+	}
+
+	if (strcmp(key, "link_type") == 0) {
+		/*
+		 * The kernel exposes link_type as a string (e.g. "xdp").
+		 * Store it directly; the integer id is reverse-looked-up
+		 * via bpf_link_type_table for BPF-LINK.TYPE.RAW.
+		 */
+		free(((struct anon_bpf_link_data *)unkn->anon_data)->type_str);
+		((struct anon_bpf_link_data *)unkn->anon_data)->type_str = xstrdup(value);
+		return 1;
+	}
+
+	if (strcmp(key, "prog_id") == 0) {
+		int32_t t = -1;
+		int rc = ul_strtos32(value, &t, 10);
+		if (rc < 0)
+			return 0; /* ignore -- parse failed */
+		((struct anon_bpf_link_data *)unkn->anon_data)->prog_id = (int)t;
+		return 1;
+	}
+
+	return 0;
+}
+
+static const struct anon_ops anon_bpf_link_ops = {
+	.class = "bpf-link",
+	.probe = anon_bpf_link_probe,
+	.get_name = anon_bpf_link_get_name,
+	.fill_column = anon_bpf_link_fill_column,
+	.init = anon_bpf_link_init,
+	.free = anon_bpf_link_free,
+	.handle_fdinfo = anon_bpf_link_handle_fdinfo,
+};
+
+
+/*
+ * io_uring
+ */
+struct anon_io_uring_data {
+	unsigned int sq_mask;
+	unsigned int sq_head;
+	unsigned int sq_tail;
+	unsigned int cq_mask;
+	unsigned int cq_head;
+	unsigned int cq_tail;
+	unsigned int sqes;
+	unsigned int cqes;
+	int sqthread;
+	int sqthread_cpu;
+	unsigned int user_files;
+	unsigned int user_bufs;
+	char napi[16];		/* "enabled", "disabled", or "" */
+	bool has_data;		/* true if fdinfo was parsed */
+};
+
+static bool anon_io_uring_probe(const char *str)
+{
+	return strncmp(str, "[io_uring]", 10) == 0;
+}
+
+static void anon_io_uring_init(struct unkn *unkn)
+{
+	struct anon_io_uring_data *data = xcalloc(1, sizeof(*data));
+
+	data->sqthread = -1;
+	data->sqthread_cpu = -1;
+	unkn->anon_data = data;
+}
+
+static void anon_io_uring_free(struct unkn *unkn)
+{
+	struct anon_io_uring_data *data = (struct anon_io_uring_data *)unkn->anon_data;
+	free(data);
+}
+
+static int anon_io_uring_handle_fdinfo(struct unkn *unkn, const char *key, const char *value)
+{
+	struct anon_io_uring_data *data = (struct anon_io_uring_data *)unkn->anon_data;
+
+	if (strcmp(key, "SqMask") == 0) {
+		if (ul_strtou32_to_struct_member(data, sq_mask, value, 16) == 0)
+			data->has_data = true;
+		return 1;
+	}
+	if (strcmp(key, "SqHead") == 0) {
+		ul_strtou32_to_struct_member(data, sq_head, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "SqTail") == 0) {
+		ul_strtou32_to_struct_member(data, sq_tail, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "CqMask") == 0) {
+		ul_strtou32_to_struct_member(data, cq_mask, value, 16);
+		return 1;
+	}
+	if (strcmp(key, "CqHead") == 0) {
+		ul_strtou32_to_struct_member(data, cq_head, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "CqTail") == 0) {
+		ul_strtou32_to_struct_member(data, cq_tail, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "SQEs") == 0) {
+		ul_strtou32_to_struct_member(data, sqes, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "CQEs") == 0) {
+		ul_strtou32_to_struct_member(data, cqes, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "SqThread") == 0) {
+		ul_strtos32_to_struct_member(data, sqthread, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "SqThreadCpu") == 0) {
+		ul_strtos32_to_struct_member(data, sqthread_cpu, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "UserFiles") == 0) {
+		ul_strtou32_to_struct_member(data, user_files, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "UserBufs") == 0) {
+		ul_strtou32_to_struct_member(data, user_bufs, value, 10);
+		return 1;
+	}
+	if (strcmp(key, "NAPI") == 0) {
+		strncpy(data->napi, value, sizeof(data->napi) - 1);
+		data->napi[sizeof(data->napi) - 1] = '\0';
+		return 1;
+	}
+
+	/* Skip known fields we don't expose as columns:
+	 *   CachedSqHead, CachedCqTail, SqTotalTime, SqWorkTime,
+	 *   PollList, CqOverflowList
+	 */
+	if (strcmp(key, "CachedSqHead") == 0
+	    || strcmp(key, "CachedCqTail") == 0
+	    || strcmp(key, "SqTotalTime") == 0
+	    || strcmp(key, "SqWorkTime") == 0
+	    || strcmp(key, "PollList") == 0
+	    || strcmp(key, "CqOverflowList") == 0)
+		return 1;
+
+	return 0;
+}
+
+static bool anon_io_uring_fill_column(struct proc *proc  __attribute__((__unused__)),
+				      struct unkn *unkn,
+				      struct libscols_line *ln __attribute__((__unused__)),
+				      int column_id,
+				      size_t column_index __attribute__((__unused__)),
+				      char **str)
+{
+	struct anon_io_uring_data *data = (struct anon_io_uring_data *)unkn->anon_data;
+
+	if (!data->has_data)
+		return false;
+
+	switch(column_id) {
+	case COL_IO_URING_SQ_MASK:
+		xasprintf(str, "0x%x", data->sq_mask);
+		return true;
+	case COL_IO_URING_SQ_HEAD:
+		xasprintf(str, "%u", data->sq_head);
+		return true;
+	case COL_IO_URING_SQ_TAIL:
+		xasprintf(str, "%u", data->sq_tail);
+		return true;
+	case COL_IO_URING_CQ_MASK:
+		xasprintf(str, "0x%x", data->cq_mask);
+		return true;
+	case COL_IO_URING_CQ_HEAD:
+		xasprintf(str, "%u", data->cq_head);
+		return true;
+	case COL_IO_URING_CQ_TAIL:
+		xasprintf(str, "%u", data->cq_tail);
+		return true;
+	case COL_IO_URING_SQES:
+		xasprintf(str, "%u", data->sqes);
+		return true;
+	case COL_IO_URING_CQES:
+		xasprintf(str, "%u", data->cqes);
+		return true;
+	case COL_IO_URING_SQTHREAD:
+		xasprintf(str, "%d", data->sqthread);
+		return true;
+	case COL_IO_URING_SQTHREAD_CPU:
+		xasprintf(str, "%d", data->sqthread_cpu);
+		return true;
+	case COL_IO_URING_USER_FILES:
+		xasprintf(str, "%u", data->user_files);
+		return true;
+	case COL_IO_URING_USER_BUFS:
+		xasprintf(str, "%u", data->user_bufs);
+		return true;
+	case COL_IO_URING_NAPI:
+		if (data->napi[0])
+			*str = xstrdup(data->napi);
+		return true;
+	default:
+		return false;
+	}
+}
+
+static char *anon_io_uring_get_name(struct unkn *unkn)
+{
+	char *str = NULL;
+	struct anon_io_uring_data *data = (struct anon_io_uring_data *)unkn->anon_data;
+
+	if (!data->has_data)
+		return NULL;
+
+	xasprintf(&str, "sqmask=0x%x cqmask=0x%x sqes=%u cqes=%u",
+		  data->sq_mask, data->cq_mask,
+		  data->sqes, data->cqes);
+
+	if (data->sqthread >= 0)
+		xstrfappend(&str, " sqthread=%d", data->sqthread);
+
+	if (data->user_files > 0 || data->user_bufs > 0)
+		xstrfappend(&str, " userfiles=%u userbufs=%u",
+			    data->user_files, data->user_bufs);
+
+	return str;
+}
+
+static const struct anon_ops anon_io_uring_ops = {
+	.class = "io_uring",
+	.probe = anon_io_uring_probe,
+	.get_name = anon_io_uring_get_name,
+	.fill_column = anon_io_uring_fill_column,
+	.init = anon_io_uring_init,
+	.free = anon_io_uring_free,
+	.handle_fdinfo = anon_io_uring_handle_fdinfo,
+};
+
+/*
  * generic (fallback implementation)
  */
 static const struct anon_ops anon_generic_ops = {
@@ -1339,6 +1696,8 @@ static const struct anon_ops *const anon_ops[] = {
 	&anon_inotify_ops,
 	&anon_bpf_prog_ops,
 	&anon_bpf_map_ops,
+	&anon_bpf_link_ops,
+	&anon_io_uring_ops,
 };
 
 static const struct anon_ops *anon_probe(const char *str)

@@ -297,7 +297,9 @@ static int sgi_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 	case SGI_LABELITEM_BOOTFILE:
 		item->name = _("Bootfile");
 		item->type = 's';
-		item->data.str = *sgilabel->boot_file ? strdup((char *) sgilabel->boot_file) : NULL;
+		item->data.str = *sgilabel->boot_file ?
+				strndup((char *) sgilabel->boot_file,
+					sizeof(sgilabel->boot_file)) : NULL;
 		break;
 	default:
 		if (item->id < __FDISK_NLABELITEMS)
@@ -328,16 +330,21 @@ static int sgi_get_sysid(struct fdisk_context *cxt, int i)
 	return be32_to_cpu(sgilabel->partitions[i].type);
 }
 
+/* returns -1 if the on-disk partition number is out of range */
 static int sgi_get_bootpartition(struct fdisk_context *cxt)
 {
 	struct sgi_disklabel *sgilabel = self_disklabel(cxt);
-	return be16_to_cpu(sgilabel->root_part_num);
+	int n = be16_to_cpu(sgilabel->root_part_num);
+
+	return n < SGI_MAXPARTITIONS ? n : -1;
 }
 
 static int sgi_get_swappartition(struct fdisk_context *cxt)
 {
 	struct sgi_disklabel *sgilabel = self_disklabel(cxt);
-	return be16_to_cpu(sgilabel->swap_part_num);
+	int n = be16_to_cpu(sgilabel->swap_part_num);
+
+	return n < SGI_MAXPARTITIONS ? n : -1;
 }
 
 static unsigned int sgi_get_lastblock(struct fdisk_context *cxt)
@@ -441,7 +448,9 @@ int fdisk_sgi_set_bootfile(struct fdisk_context *cxt)
 	char *name = NULL;
 	struct sgi_disklabel *sgilabel = self_disklabel(cxt);
 
-	fdisk_info(cxt, _("The current boot file is: %s"), sgilabel->boot_file);
+	/* boot_file[] is not NUL-terminated if the name uses all 16 bytes */
+	fdisk_info(cxt, _("The current boot file is: %.*s"),
+			(int) sizeof(sgilabel->boot_file), sgilabel->boot_file);
 
 	rc = fdisk_ask_string(cxt, _("Enter full path of the new boot file"), &name);
 	if (rc == 0)
@@ -482,9 +491,9 @@ static int sgi_write_disklabel(struct fdisk_context *cxt)
 
 	assert(sgi_pt_checksum(sgilabel) == 0);
 
-	if (lseek(cxt->dev_fd, 0, SEEK_SET) < 0)
+	if (ul_vfs_lseek(cxt->vfs, cxt->dev_fd, 0, SEEK_SET) < 0)
 		goto err;
-	if (write_all(cxt->dev_fd, sgilabel, DEFAULT_SECTOR_SIZE))
+	if (ul_vfs_write_all(cxt->vfs, cxt->dev_fd, sgilabel, DEFAULT_SECTOR_SIZE))
 		goto err;
 	if (!strncmp((char *) sgilabel->volume[0].name, "sgilabel", 8)) {
 		/*
@@ -494,13 +503,13 @@ static int sgi_write_disklabel(struct fdisk_context *cxt)
 		int infostartblock
 			= be32_to_cpu(sgilabel->volume[0].block_num);
 
-		if (lseek(cxt->dev_fd, (off_t) infostartblock *
+		if (ul_vfs_lseek(cxt->vfs, cxt->dev_fd, (off_t) infostartblock *
 					DEFAULT_SECTOR_SIZE, SEEK_SET) < 0)
 			goto err;
 		info = sgi_new_info();
 		if (!info)
 			goto err;
-		if (write_all(cxt->dev_fd, info, sizeof(*info)))
+		if (ul_vfs_write_all(cxt->vfs, cxt->dev_fd, info, sizeof(*info)))
 			goto err;
 	}
 
@@ -806,7 +815,7 @@ static int sgi_delete_partition(struct fdisk_context *cxt, size_t partnum)
 	assert(cxt);
 	assert(cxt->label);
 
-	if (partnum > cxt->label->nparts_max)
+	if (partnum >= cxt->label->nparts_max)
 		return -EINVAL;
 
 	rc = set_partition(cxt, partnum, 0, 0, 0);
@@ -978,7 +987,7 @@ static int sgi_create_disklabel(struct fdisk_context *cxt)
 	if (cxt->geom.heads && cxt->geom.sectors) {
 		fdisk_sector_t llsectors;
 
-		if (blkdev_get_sectors(cxt->dev_fd, (unsigned long long *) &llsectors) == 0) {
+		if (blkdev_get_sectors(cxt->dev_fd, &llsectors) == 0) {
 			/* the get device size ioctl was successful */
 			fdisk_sector_t llcyls;
 			int sec_fac = cxt->sector_size / 512;

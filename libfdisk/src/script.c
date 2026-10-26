@@ -167,7 +167,7 @@ struct fdisk_script *fdisk_new_script_from_file(struct fdisk_context *cxt,
 	assert(filename);
 
 	DBG(SCRIPT, ul_debug("opening %s", filename));
-	f = fopen(filename, "r");
+	f = fopen(filename, "r" UL_CLOEXECSTR);
 	if (!f)
 		return NULL;
 
@@ -302,6 +302,44 @@ const char *fdisk_script_get_header(struct fdisk_script *dp, const char *name)
 
 	fi = script_get_header(dp, name);
 	return fi ? fi->data : NULL;
+}
+
+/*
+ * Reads the script header @name as a number. If the value uses a size suffix
+ * (e.g. "2MiB") then it's converted to sectors by the device sector size.
+ *
+ * Returns: 0 on success, 1 if the header is not defined, <0 on error.
+ */
+int fdisk_script_get_u64(struct fdisk_context *cxt,
+			 const char *name, uint64_t *num)
+{
+	const char *str;
+	uintmax_t x = 0;
+	int pwr = 0, rc;
+
+	assert(cxt);
+	assert(name);
+	assert(num);
+
+	*num = 0;
+
+	if (!cxt->script)
+		return 1;
+
+	str = fdisk_script_get_header(cxt->script, name);
+	if (!str)
+		return 1;
+
+	rc = ul_parse_size(str, &x, &pwr);
+	if (rc < 0) {
+		fdisk_warnx(cxt, _("Cannot parse script header \"%s\"."), name);
+		return rc;
+	}
+	if (pwr)
+		x /= cxt->sector_size;
+
+	*num = x;
+	return 0;
 }
 
 /**
@@ -1712,9 +1750,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	fd = mkstemp_cloexec(name);
 	if (fd < 0)
 		err(EXIT_FAILURE, "mkstemp() failed");
-	if (write_all(fd, data, size) != 0)
+	if (ul_write_all(fd, data, size) != 0)
 		err(EXIT_FAILURE, "write() failed");
-	f = fopen(name, "r");
+	f = fopen(name, "r" UL_CLOEXECSTR);
 	if (!f)
 		err(EXIT_FAILURE, "cannot open %s", name);
 
@@ -1770,7 +1808,7 @@ static int test_read(struct fdisk_test *ts __attribute__((unused)),
 	struct fdisk_context *cxt;
 	FILE *f;
 
-	if (!(f = fopen(filename, "r")))
+	if (!(f = fopen(filename, "r" UL_CLOEXECSTR)))
 		err(EXIT_FAILURE, "%s: cannot open", filename);
 
 	cxt = fdisk_new_context();

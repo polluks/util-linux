@@ -17,10 +17,13 @@
  */
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/eventfd.h>
 
 #include "mountP.h"
 #include "strutils.h"
 #include "strv.h"
+#include "fileutils.h"
+#include "all-io.h"
 
 #if defined(HAVE_SMACK)
 static int is_option(const char *name, const char *const *names)
@@ -382,6 +385,7 @@ static int exec_helper(struct libmnt_context *cxt)
 	char *namespace = NULL;
 	int rc;
 	pid_t pid;
+	int errfd = -1;
 
 	assert(cxt);
 	assert(cxt->fs);
@@ -395,6 +399,13 @@ static int exec_helper(struct libmnt_context *cxt)
 			getpid(), ns_tgt->fd) == -1) {
 		return -ENOMEM;
 	}
+
+	/* Diagnostic-only channel to learn the helper's execv() errno.
+	 * Best effort: this is purely optional and must never be able to
+	 * stall the mount itself, so the fd is non-blocking and errfd
+	 * simply stays at -1 (its initialized value) if eventfd() fails --
+	 * later code only uses it when errfd >= 0. */
+	errfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 
 	DBG_FLUSH;
 
@@ -461,6 +472,10 @@ static int exec_helper(struct libmnt_context *cxt)
 							i, args[i]));
 		DBG_FLUSH;
 		execv(cxt->helper, (char * const *) args);
+		if (errfd >= 0) {
+			uint64_t errsv = (uint64_t) errno;
+			ul_write_all(errfd, (char *) &errsv, sizeof(errsv));
+		}
 		_exit(MNT_EX_EXEC);
 	}
 	default:
@@ -476,20 +491,33 @@ static int exec_helper(struct libmnt_context *cxt)
 			cxt->helper_exec_status = rc = 0;
 
 			if (cxt->helper_status == MNT_EX_EXEC) {
+				uint64_t errsv = 0;
+				ssize_t len = -1;
+
+				if (errfd >= 0)
+					len = ul_read_all(errfd, (char *) &errsv, sizeof(errsv));
+				cxt->helper_errno = (len == (ssize_t) sizeof(errsv)) ? (int) errsv : 0;
+
 				rc = -MNT_ERR_EXEC;
-				DBG_OBJ(CXT, cxt, ul_debug("%s exec failed", cxt->helper));
+				DBG_OBJ(CXT, cxt, ul_debug("%s exec failed [errno=%d]",
+						cxt->helper, cxt->helper_errno));
 			}
 
 			DBG_OBJ(CXT, cxt, ul_debug("%s forked [status=%d, rc=%d]",
 				cxt->helper,
 				cxt->helper_status, rc));
 		}
+
+		if (errfd >= 0)
+			close(errfd);
 		break;
 	}
 
 	case -1:
 		cxt->helper_exec_status = rc = -errno;
 		DBG_OBJ(CXT, cxt, ul_debug("fork() failed"));
+		if (errfd >= 0)
+			close(errfd);
 		break;
 	}
 
@@ -523,8 +551,29 @@ static int do_mount(struct libmnt_context *cxt, const char *try_type)
 			return rc;
 	}
 
-	if (cxt->helper)
-		return exec_helper(cxt);
+	if (cxt->helper) {
+		rc = exec_helper(cxt);
+
+		/* The helper has done the mount, so the target FD pinned by
+		 * prepare_target() still refers to the directory which is
+		 * covered by the new mount now. Re-open it, otherwise the
+		 * MNT_STAGE_POST hooks would work with the underlying
+		 * directory -- X-mount.owner=, X-mount.group= and
+		 * X-mount.mode= would modify the mount point itself and the
+		 * change would survive umount.
+		 *
+		 * The helper mounts outside of libmount and gives us no handle
+		 * to the new mount, so there is no ID to verify the re-opened
+		 * FD with and none for utab either; mnt_context_finalize_target()
+		 * reads the IDs from the new mount point, the same way as for
+		 * classic mount(2).
+		 */
+		if (rc == 0
+		    && mnt_context_helper_executed(cxt)
+		    && mnt_context_get_helper_status(cxt) == 0)
+			rc = mnt_context_finalize_target(cxt);
+		return rc;
+	}
 
 	if (try_type) {
 		ol = mnt_context_get_optlist(cxt);
@@ -582,6 +631,22 @@ static int is_success_status(struct libmnt_context *cxt)
 	return 0;
 }
 
+/* Check if the mount stage explicitly failed (helper or syscall returned
+ * an error). Unlike is_success_status(), this treats "nothing happened"
+ * as not-failed -- the MOUNT stage may be a no-op for operations like
+ * bind/move with the new mount API where open_tree() runs in PREP and
+ * move_mount() is deferred to MOUNT_POST. */
+static int is_mount_stage_failed(struct libmnt_context *cxt)
+{
+	if (mnt_context_helper_executed(cxt))
+		return mnt_context_get_helper_status(cxt) != 0;
+
+	if (mnt_context_syscall_called(cxt))
+		return mnt_context_get_status(cxt) != 1;
+
+	return 0;
+}
+
 static int is_termination_status(struct libmnt_context *cxt)
 {
 	if (is_success_status(cxt))
@@ -624,8 +689,11 @@ static int do_mount_by_types(struct libmnt_context *cxt, const char *types)
 				return rc;
 			}
 			p = autotype;
+			/* the type comes from the system, not from the user */
+			cxt->flags &= ~MNT_FL_FSTYPE_EXPLICIT;
 			DBG_OBJ(CXT, cxt, ul_debug("   --> '%s'", p));
-		}
+		} else
+			cxt->flags |= MNT_FL_FSTYPE_EXPLICIT;
 
 		if (p)
 			rc = do_mount(cxt, p);
@@ -683,6 +751,51 @@ static int do_mount_by_pattern(struct libmnt_context *cxt, const char *pattern)
 	return rc;
 }
 
+/*
+ * Pin the target for non-root users.
+ *
+ * The target comes from fstab, but any component of the path may be a symlink
+ * controlled by the user. mnt_resolve_path() would follow it with root
+ * privileges and the mount would end up somewhere else. Open the path as it is
+ * with RESOLVE_NO_SYMLINKS instead, and then use the name the kernel gives to
+ * the pinned directory as the canonical target.
+ *
+ * The name is symlink free and normalized, and it's the same name the kernel
+ * later reports in mountinfo -- utab and non-root umount rely on that.
+ */
+static int pin_target(struct libmnt_context *cxt)
+{
+	const char *tgt;
+	char *path;
+	int fd, rc = 0;
+
+	fd = mnt_context_get_target_fd(cxt);
+	if (fd < 0) {
+		rc = -errno;
+		DBG_OBJ(CXT, cxt, ul_debug("failed to pin target [rc=%d]", rc));
+
+		/* the kernel refuses a symlink in the path with ELOOP, which
+		 * is confusing without a hint about the new restriction */
+		if (rc == -ELOOP)
+			mnt_context_sprintf_mesg(cxt, _("e symbolic links in the "
+				"mount point path are not allowed for non-root users"));
+		return rc;
+	}
+
+	path = ul_fd_get_path(fd);
+	if (!path) {
+		DBG_OBJ(CXT, cxt, ul_debug("failed to read pinned target path"));
+		return -errno;
+	}
+
+	tgt = mnt_fs_get_target(cxt->fs);
+	if (!tgt || strcmp(path, tgt) != 0)
+		rc = mnt_fs_set_target(cxt->fs, path);
+
+	free(path);
+	return rc;
+}
+
 static int prepare_target(struct libmnt_context *cxt)
 {
 	const char *tgt, *prefix;
@@ -726,8 +839,11 @@ static int prepare_target(struct libmnt_context *cxt)
 	if (!ns_old)
 		return -MNT_ERR_NAMESPACE;
 
-	/* canonicalize the path */
-	if (rc == 0 && !mnt_context_is_xnocanonicalize(cxt, "target")) {
+	/* canonicalize the path; for non-root users this is done later from
+	 * the pinned target FD, see pin_target() */
+	if (rc == 0
+	    && !mnt_context_target_fd_required(cxt)
+	    && !mnt_context_is_xnocanonicalize(cxt, "target")) {
 		struct libmnt_cache *cache = mnt_context_get_cache(cxt);
 
 		if (cache) {
@@ -740,12 +856,8 @@ static int prepare_target(struct libmnt_context *cxt)
 	if (rc == 0)
 		rc = mnt_context_call_hooks(cxt, MNT_STAGE_PREP_TARGET);
 
-	if (rc == 0
-	    && mnt_context_target_fd_required(cxt)
-	    && mnt_context_get_target_fd(cxt) < 0) {
-		DBG_OBJ(CXT, cxt, ul_debug("failed to pin target"));
-		rc = -errno;
-	}
+	if (rc == 0 && mnt_context_target_fd_required(cxt))
+		rc = pin_target(cxt);
 
 	if (!mnt_context_switch_ns(cxt, ns_old))
 		return -MNT_ERR_NAMESPACE;
@@ -874,8 +986,10 @@ int mnt_context_do_mount(struct libmnt_context *cxt)
 
 	/* before mount stage */
 	rc = mnt_context_call_hooks(cxt, MNT_STAGE_MOUNT_PRE);
-	if (rc)
-		return rc;
+	if (rc) {
+		res = rc;
+		goto end;
+	}
 
 	/* mount stage */
 	type = mnt_fs_get_fstype(cxt->fs);
@@ -888,13 +1002,15 @@ int mnt_context_do_mount(struct libmnt_context *cxt)
 	} else
 		res = do_mount_by_pattern(cxt, cxt->fstype_pattern);
 
-	/* after mount stage */
-	if (res == 0) {
+	/* after mount stage -- the post-mount hooks are commit-path only,
+	 * skip them if the mount helper or syscall has failed */
+	if (res == 0 && !is_mount_stage_failed(cxt)) {
 		rc = mnt_context_call_hooks(cxt, MNT_STAGE_MOUNT_POST);
 		if (rc)
-			return rc;
+			res = rc;
 	}
 
+end:
 	if (!mnt_context_switch_ns(cxt, ns_old))
 		return -MNT_ERR_NAMESPACE;
 
@@ -1107,7 +1223,7 @@ again:
 			goto again;
 	}
 
-	if (rc == 0)
+	if (rc == 0 && !is_mount_stage_failed(cxt))
 		rc = mnt_context_call_hooks(cxt, MNT_STAGE_POST);
 
 	mnt_context_deinit_hooksets(cxt);
@@ -1187,8 +1303,9 @@ int mnt_context_next_mount(struct libmnt_context *cxt,
 	/*  ignore swap */
 	if (mnt_fs_is_swaparea(*fs) ||
 
-	/* ignore root filesystem */
-	   (tgt && (strcmp(tgt, "/") == 0 || strcmp(tgt, "root") == 0)) ||
+	/* ignore root filesystem (but not with --target-prefix) */
+	   (tgt && !mnt_context_get_target_prefix(cxt) &&
+		   (strcmp(tgt, "/") == 0 || strcmp(tgt, "root") == 0)) ||
 
 	/* ignore noauto filesystems */
 	   (o && mnt_optstr_get_option(o, "noauto", NULL, NULL) == 0) ||
@@ -1427,7 +1544,7 @@ static int is_shared_tree(struct libmnt_context *cxt, const char *dir)
 		return -MNT_ERR_NAMESPACE;
 
 	if (!dir)
-		return 0;
+		goto done;
 	if (mnt_context_get_mountinfo(cxt, &tb) || !tb)
 		goto done;
 
@@ -1500,7 +1617,14 @@ int mnt_context_get_mount_excode(
 				snprintf(buf, bufsz, _("WARNING: failed to apply propagation flags"));
 				break;
 			case -MNT_ERR_EXEC:
-				snprintf(buf, bufsz, _("failed to execute %s"), cxt->helper);
+				if (cxt->helper_errno) {
+					int errsv = errno;
+
+					errno = cxt->helper_errno;
+					snprintf(buf, bufsz, _("failed to execute %s: %m"), cxt->helper);
+					errno = errsv;
+				} else
+					snprintf(buf, bufsz, _("failed to execute %s"), cxt->helper);
 				break;
 			}
 		}
@@ -1786,8 +1910,9 @@ int mnt_context_get_mount_excode(
 		if (!buf)
 			break;
 		if (mnt_context_get_fstype(cxt))
+			/* report the driver name we really asked the kernel for */
 			snprintf(buf, bufsz, _("unknown filesystem type '%s'"),
-					mnt_context_get_fstype(cxt));
+					mnt_context_get_mounttype(cxt));
 		else
 			snprintf(buf, bufsz, _("unknown filesystem type"));
 		break;

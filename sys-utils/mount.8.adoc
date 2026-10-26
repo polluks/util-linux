@@ -188,7 +188,13 @@ For more details, see *fstab*(5). Only the user that mounted a filesystem can un
 
 The *user* mount option is accepted if no username is specified. If used in the format *user=someone*, the option is silently ignored and visible only for external mount helpers (/sbin/mount.<type>) for compatibility with some network filesystems.
 
-WARNING: When using the legacy *mount*(2) syscall (on older kernels without the new mount API), the mount target path is resolved by the kernel at syscall time. This means there is an inherent time-of-check-to-time-of-use (TOCTOU) window between the permission verification and the actual mount operation. If an ancestor directory of the mount target is writable by the unprivileged user, a path component could be swapped to redirect the mount to an unintended location. The new mount API (available since Linux 5.2) eliminates this issue by using file-descriptor-based target resolution. Administrators should ensure that mount target paths for *user* mounts do not traverse directories writable by unprivileged users.
+For unprivileged users the mount target from _fstab_ is opened before the filesystem is attached and the mount operation uses this file descriptor rather than the path, so the path is not resolved for the second time by the kernel. Symbolic links are not followed in the target path at all, a _fstab_ entry with a symbolic link in the mount point path is unusable for unprivileged users and the mount fails.
+
+WARNING: When the new mount API is not available (Linux before 5.2, or *mount*(8) compiled without the support for it), the legacy *mount*(2) syscall is used. In this case the pinned target is referenced by a _/proc/self/fd/_ path, which requires a mounted _/proc_ filesystem. Without _/proc_ the target path is resolved by the kernel again and the inherent time-of-check-to-time-of-use (TOCTOU) window between the verification and the mount operation remains; if an ancestor directory of the mount target is writable by the unprivileged user, a path component could be swapped to redirect the mount to an unintended location. Administrators should ensure that mount target paths for *user* mounts do not traverse directories writable by unprivileged users.
+
+For mount source paths, *mount*(8) only canonicalizes (resolves symlinks) paths starting with _/dev/_ for unprivileged users and verifies the result stays within _/dev/_. Source paths outside _/dev/_ (e.g. disk images in user-writable directories) are kept as-is from _fstab_.
+
+Filesystem type auto-detection for unprivileged users relies exclusively on *udev* metadata rather than direct device probing; this means file images that are not registered with udev require an explicit filesystem type in _fstab_.
 
 === Bind mount operation
 
@@ -381,7 +387,7 @@ Move a subtree to some other place. See above, the subsection *The move operatio
 Allow to make a target directory (mountpoint) if it does not exist yet. Alias to "-o X-mount.mkdir[=mode]", the default mode is 0755. For more details see *X-mount.mkdir* below.
 
 *--map-groups*, *--map-users* _inner_:_outer_:_count_::
-Add the specified user/group mapping to an *X-mount.idmap* map. These options can be given multiple times to build up complete mappings for users and groups. For more details see *X-mount.idmap* below.
+Add the specified user/group mapping to an *X-mount.idmap* map. The _inner_ ID is the starting ID as stored in the filesystem and the _outer_ ID is the starting ID as it appears in the new mount. These options can be given multiple times to build up complete mappings for users and groups. For more details see *X-mount.idmap* below.
 
 *--map-users* /proc/_PID_/ns/user::
 Use the specified user namespace for user and group mapping in an id-mapped mount. This is an alias for "-o X-mount.idmap=/proc/_PID_/ns/user" and cannot be used twice nor together with the _inner_:_outer_:_count_ option format above. For more details see *X-mount.idmap* below.
@@ -470,10 +476,12 @@ The argument following the *-t* is used to indicate the filesystem type. The fil
 +
 The programs *mount* and *umount*(8) support filesystem subtypes. The subtype is defined by a '.subtype' suffix. For example 'fuse.sshfs'. It's recommended to use subtype notation rather than add any prefix to the mount source (for example 'sshfs#example.com' is deprecated).
 +
-If no *-t* option is given, or if the *auto* type is specified, *mount* will try to guess the desired type. *mount* uses the *libblkid*(3) library for guessing the filesystem type; if that does not turn up anything that looks familiar, *mount* will try to read the file _/etc/filesystems_, or, if that does not exist, _/proc/filesystems_. All of the filesystem types listed there will be tried, except for those that are labeled "nodev" (e.g. _devpts_, _proc_ and _nfs_). If _/etc/filesystems_ ends in a line with a single {asterisk}, mount will read _/proc/filesystems_ afterwards. While trying, all filesystem types will be mounted with the mount option *silent*.
+If no *-t* option is given, or if the *auto* type is specified, *mount* will try to guess the desired type. The filesystem type is determined using *udev* metadata first, then by direct device probing via *libblkid*(3) for root users. If neither method identifies the type, *mount* will fall back to trying all types listed in _/etc/filesystems_, or if that file does not exist, _/proc/filesystems_. Types labeled "nodev" (e.g. _devpts_, _proc_ and _nfs_) are skipped. If _/etc/filesystems_ ends in a line with a single {asterisk}, mount will read _/proc/filesystems_ afterwards. While trying, all filesystem types will be mounted with the mount option *silent*. For types determined this way, the kernel driver and the external helper can be overridden by configuration files; see *CONFIG FILE* below.
 //TRANSLATORS: Keep {asterisk} untranslated.
 +
-The *auto* type may be useful for user-mounted floppies. Creating a file _/etc/filesystems_ can be useful to change the probe order (e.g., to try vfat before msdos or ext3 before ext2) or if you use a kernel module autoloader.
+For unprivileged (non-root) users, direct device probing via *libblkid*(3) is disabled and filesystem type detection relies exclusively on *udev* metadata. This means file images that are not registered with *udev* require an explicit filesystem type in _fstab_.
++
+Creating a file _/etc/filesystems_ can be useful to change the probe order (e.g., to try vfat before msdos or ext3 before ext2) or if you use a kernel module autoloader.
 +
 More than one type may be specified in a comma-separated list, for the *-t* option as well as in an _/etc/fstab_ entry. The list of filesystem types for the *-t* option can be prefixed with *no* to specify the filesystem types on which no action should be taken. The prefix *no* has no effect when specified in an _/etc/fstab_ entry.
 +
@@ -796,7 +804,7 @@ Allows disabling of canonicalization for mount source and target paths. By defau
 +
 The command-line option *--no-canonicalize* overrides this mount option and affects all path and tag conversions in all situations, but for backward compatibility, it does not modify *open_tree*(2) syscall flags and does not allow the bind-mount over a symbolic link use case.
 +
-Note that *mount*(8) ignores this option for unprivileged (non-root) users. Paths are always canonicalized in restricted mode to ensure safe target resolution.
+Note that *mount*(8) ignores this option for unprivileged (non-root) users. In restricted mode symbolic links are not followed in the target path at all, so a mount with a symbolic link in the target fails. Source paths are only canonicalized when starting with _/dev/_. See section "Non-superuser mounts" above for more details.
 
 *X-mount.noloop*::
 Do not create and mount a loop device, even if the source of the mount is a regular file.
@@ -818,31 +826,32 @@ Set _mountpoint_'s ownership after mounting. Names resolved in the target mount 
 *X-mount.mode*=_mode_::
 Set _mountpoint_'s mode after mounting.
 
-*X-mount.idmap*=__id-type__:__id-mount__:__id-host__:__id-range__ [__id-type__:__id-mount__:__id-host__:__id-range__], *X-mount.idmap*=__file__::
+*X-mount.idmap*=__type__:__inner__:__outer__:__range__ [__type__:__inner__:__outer__:__range__], *X-mount.idmap*=__file__::
 Use this option to create an idmapped mount.
-An idmapped mount allows to change ownership of all files located under a mount according to the ID-mapping associated with a user namespace.
-The ownership change is tied to the lifetime and localized to the relevant mount.
+This feature requires the new file-descriptor-based mount API (available since Linux 5.2).
+An idmapped mount allows the ownership of all files located under a mount to be changed according to the ID-mapping associated with a user namespace.
+The ownership change is tied to the lifetime of, and localized to, the relevant mount.
 The relevant ID-mapping can be specified in two ways:
 +
 * A user can specify the ID-mapping directly.
 +
-The ID-mapping must be specified using the syntax __id-type__:__id-mount__:__id-host__:__id-range__.
-Specifying *u* as the __id-type__ prefix creates a UID-mapping, *g* creates a GID-mapping and omitting __id-type__ or specifying *b* creates both a UID- and GID-mapping.
-The __id-mount__ parameter indicates the starting ID in the new mount.
-The __id-host__ parameter indicates the starting ID in the filesystem.
-The __id-range__ parameter indicates how many IDs are to be mapped.
+The ID-mapping must be specified using the syntax __type__:__inner__:__outer__:__range__.
+Specifying *u* as the __type__ prefix creates a UID-mapping, *g* creates a GID-mapping and omitting __type__ or specifying *b* creates both a UID- and GID-mapping.
+The __inner__ and __outer__ IDs are given in the same order as in _/proc/[pid]/uid_map_ (see *user_namespaces*(7)) and for *--map-users* above.
+For an idmapped mount this means that __inner__ is the starting ID as stored in the filesystem, and __outer__ is the starting ID as it appears in the new mount.
+The __range__ parameter indicates how many IDs are to be mapped.
 It is possible to specify multiple ID-mappings.
 +
 The individual ID mappings must be separated by spaces. Please note that in the __/etc/fstab__ file, spaces are interpreted as separators between fields. To avoid this, you must escape them using \040. For example, X-mount.idmap=0:0:1\040500:1000:1.
 +
-For example, the ID-mapping *X-mount.idmap=u:1000:0:1 g:1001:1:2 5000:1000:2* creates an idmapped mount where
-UID 0 is mapped to UID 1000, GID 1 is mapped to GUID 1001, GID 2 is mapped to GID 1002, UID and GID 1000 are mapped to 5000, and UID and GID 1001 are mapped to 5001 in the mount.
+For example, the ID-mapping *X-mount.idmap=u:1000:0:1 g:1001:1:2 5000:1000:2* creates an idmapped mount where a file owned by
+UID 1000 in the filesystem appears as owned by UID 0 in the mount, GID 1001 appears as GID 1, GID 1002 appears as GID 2, UID and GID 5000 appear as 1000, and UID and GID 5001 appear as 1001.
 +
-When an ID-mapping is specified directly a new user namespace will be allocated with the requested ID-mapping.
+When an ID-mapping is specified directly, a new user namespace will be allocated with the requested ID-mapping.
 The newly created user namespace will be attached to the mount.
 * A user can specify a user namespace file.
 +
-The user namespace will then be attached to the mount and the ID-mapping of the user namespace will become the ID-mapping of the mount.
+The user namespace will then be attached to the mount, and the ID-mapping of the user namespace will become the ID-mapping of the mount.
 +
 For example, *X-mount.idmap=/proc/PID/ns/user* will attach the user namespace of the process PID to the mount.
 
@@ -1752,6 +1761,125 @@ The command *mount* does not pass the mount options *unbindable*, *runbindable*,
 
 The exit status value of the helper is returned as the exit status of *mount*(8). The value 126 is sed if the mount helper program is found, but the execl() failed.
 
+== CONFIG FILE
+
+*mount* and *umount*(8) read their configuration from
+
+____
+_/etc/mount/_
+
+_/run/mount/_
+
+_/usr/lib/mount/_
+____
+
+Files in _/etc_ take priority over _/run_, which takes priority over
+_/usr/lib_. The first file found is the one which is used, and it is used as a
+whole; a file in _/etc_ therefore *replaces* the file shipped by the
+distribution in _/usr/lib_ rather than modifying it.
+
+This is how a distribution provides its defaults and how the administrator
+overrides them: the distribution ships _/usr/lib/mount/fs.d/_**__type__**_.conf_
+and the administrator writes _/etc/mount/fs.d/_**__type__**_.conf_, which has
+to contain all the settings that should be in effect, as the file provided by
+the distribution is not used at all anymore. To change a single setting and
+keep the rest, use a drop-in instead.
+
+Settings can be added in drop-in directories named after the file with a
+_.d_ suffix, for example _fs.d/ntfs.conf.d/50-local.conf_. The drop-ins are
+collected from all three locations, where a drop-in in _/etc_ replaces a
+drop-in of the *same name* in _/run_ or _/usr/lib_. Apart from this, the
+location of a drop-in does not matter; the priority is given by the name
+only, so a drop-in in _/usr/lib_ overwrites a drop-in in _/etc_ if it sorts
+after it. It is therefore a good practice to prefix the names with a number.
+
+The main file is evaluated first and the drop-ins after it in the alphabetical
+order of their names, and the later file overwrites the settings of the
+previous one. This means that a drop-in has priority over the main file and
+over the drop-ins which sort before it, and that a drop-in can be used to
+change a single setting without replacing the whole file. A setting which no
+drop-in defines is still used from the main file.
+
+Only regular files owned by root and not writable by group or others are used.
+
+The format is _key_ = _value_, one setting per line; everything after a '#' is
+ignored.
+
+The configuration is split into subdirectories according to what it applies
+to. Currently the only supported subdirectory is _fs.d_.
+
+=== Filesystem type configuration
+
+____
+_/etc/mount/fs.d/_**__type__**_.conf_
+____
+
+The name of a filesystem and the name of the kernel driver that implements it
+are not necessarily the same, and more than one implementation may be
+available. For example an NTFS filesystem can be mounted by the *ntfs3* kernel
+driver or by the *ntfs-3g* FUSE helper. Which one is used is a decision for the
+distribution or the system administrator, and it is configured per filesystem
+type, where _type_ is the name of the filesystem. The supported keys are:
+
+*mounttype*::
+Name of the kernel filesystem driver to use for the *mount*(2) or *fsopen*(2)
+syscall instead of the filesystem type. For example
++
+----
+# /etc/mount/fs.d/ntfs.conf
+mounttype = ntfs3
+----
++
+makes *mount* ask the kernel for the _ntfs3_ driver for a filesystem detected
+as _ntfs_.
+
+*helper*::
+Suffix of the external helper, so that **/sbin/mount.**__suffix__ is executed
+instead of **/sbin/mount.**__type__ (and **/sbin/umount.**__suffix__ for
+*umount*(8)). The reserved name *none* means that no helper is used at all, so
+the filesystem is mounted by the kernel driver even if a helper is installed:
++
+----
+# /etc/mount/fs.d/ntfs.conf
+mounttype = ntfs3
+helper = none
+----
+
+Both settings are used only if the filesystem type comes from the system: the
+type detected by *libblkid*(3) or *udev* for *mount*(8), and the type reported
+by the kernel for *umount*(8). A type requested by the user, by *-t* on the
+command line or in _/etc/fstab_, is always used as-is, and *mount -i* always
+wins over *helper*. In other words both names are resolved in the same order:
+
+....
+helper suffix = -t <type>  >  helper=<suffix>     >  <type>
+syscall type  = -t <type>  >  mounttype=<driver>  >  <type>
+....
+
+Note that *umount*(8) uses the configuration file named after the type reported
+by the kernel, which is the driver that mounted the filesystem rather than the
+originally detected type; a filesystem detected as _ntfs_ and mounted with
+*mounttype=ntfs3* is unmounted according to _fs.d/ntfs3.conf_. For some
+filesystem families the kernel reports a generic name, because the *statfs*(2)
+magic number is shared by the whole family (all ext2, ext3 and ext4
+filesystems are reported as _ext4_).
+
+The following table summarizes the usual setups for NTFS, assuming _ntfs-3g_ is
+installed:
+
+|===
+|Goal |Configuration
+
+|Keep the current behavior
+|no file; the helper is used if installed
+
+|Always use *ntfs-3g*
+|*helper = ntfs-3g*
+
+|Use the kernel driver even though *ntfs-3g* is installed
+|*mounttype = ntfs3* and *helper = none*
+|===
+
 == ENVIRONMENT
 
 *LIBBLKID_DEBUG*=all::
@@ -1790,6 +1918,9 @@ temporary file (unused on systems with _mtab_ symbolic link)
 
 _/etc/filesystems_::
 a list of filesystem types to try
+
+_/etc/mount/fs.d/_**__type__**_.conf_::
+per-filesystem type configuration; see *CONFIG FILE*
 
 == HISTORY
 

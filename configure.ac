@@ -343,7 +343,6 @@ AC_CHECK_HEADERS([ \
 	linux/falloc.h \
 	linux/fd.h \
 	linux/fiemap.h \
-	linux/landlock.h \
 	linux/kcmp.h \
 	linux/net_namespace.h \
 	linux/nsfs.h \
@@ -533,6 +532,7 @@ have_sys_signalfd_h=$ac_cv_header_sys_signalfd_h
 have_utmpx_h=$ac_cv_header_utmpx_h
 have_mntent_h=$ac_cv_header_mntent_h
 have_sys_vfs_h=$ac_cv_header_sys_vfs_h
+have_lastlog_h=$ac_cv_header_lastlog_h
 have_linux_bpf_h=$ac_cv_header_linux_bpf_h
 
 AS_CASE([$linux_os:$have_linux_version_h],
@@ -563,9 +563,13 @@ AC_CHECK_MEMBERS([struct termios.c_line],,,
 AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec],,,
     [[#include <sys/stat.h>]])
 
-AC_CHECK_TYPES([struct statx], [have_struct_statx=yes], [have_struct_statx=no], [[#include <sys/stat.h>]])
-AC_CHECK_MEMBERS([struct statx.stx_mnt_id],,,
-    [[#include <sys/stat.h>]])
+AS_IF([test "x$linux_os" = xyes], [
+  AC_CHECK_TYPES([struct statx], [have_struct_statx=yes], [have_struct_statx=no], [[#include <sys/stat.h>]])
+  AC_CHECK_MEMBERS([struct statx.stx_mnt_id],,,
+      [[#include <sys/stat.h>]])
+], [
+  have_struct_statx=no
+])
 
 AC_CHECK_DECLS([_NL_TIME_WEEK_1STDAY],[],[],[[#include <langinfo.h>]])
 
@@ -585,6 +589,18 @@ AC_CHECK_DECL([BPF_OBJ_NAME_LEN],
 AC_CHECK_DECL([BPF_TAG_SIZE],
 	      [have_bpf_tag_size=yes], [have_bpf_tag_size=no],
 	      [#include <linux/bpf.h>])
+AC_CHECK_DECL([BPF_LINK_CREATE],
+	      [have_bpf_link_create=yes], [have_bpf_link_create=no],
+	      [#include <linux/bpf.h>])
+AS_IF([test "x$have_bpf_link_create" = xyes],
+	      [AC_DEFINE([HAVE_BPF_LINK_CREATE], [1], [Define if BPF_LINK_CREATE is available])])
+AC_CHECK_DECL([BPF_F_MMAPABLE],
+	      [have_bpf_f_mmapable=yes], [have_bpf_f_mmapable=no],
+	      [#include <linux/bpf.h>])
+AS_IF([test "x$have_bpf_f_mmapable" = xyes],
+      [AC_DEFINE([HAVE_BPF_F_MMAPABLE], [1], [Define if BPF_F_MMAPABLE is available])])
+
+AC_CHECK_HEADERS([linux/io_uring.h])
 
 AC_CHECK_DECL([TIOCGLCKTRMIOS],
 	      [have_tiocglcktrmios=yes], [have_tiocglcktrmios=no],
@@ -615,6 +631,7 @@ AC_CHECK_FUNCS([ \
 	err \
 	errx \
 	explicit_bzero \
+	fchmodat2 \
 	__fpending \
 	__fpurge \
 	fpurge \
@@ -635,9 +652,6 @@ AC_CHECK_FUNCS([ \
 	getttynam \
 	inotify_init \
 	jrand48 \
-	landlock_create_ruleset \
-	landlock_add_rule \
-	landlock_restrict_self \
 	lchown \
 	lgetxattr \
 	llistxattr \
@@ -697,10 +711,14 @@ AC_CHECK_FUNCS([open_memstream], [have_open_memstream=yes],[have_open_memstream=
 AC_CHECK_FUNCS([posix_fallocate], [have_posix_fallocate=yes], [have_posix_fallocate=no])
 AC_CHECK_FUNCS([reboot], [have_reboot=yes],[have_reboot=no])
 AC_CHECK_FUNCS([updwtmpx updwtmpx], [have_gnu_utmpx=yes], [have_gnu_utmpx=no])
-AC_CHECK_FUNCS([statx], [have_statx=yes], [have_statx=no])
+AS_IF([test "x$linux_os" = xyes], [
+  AC_CHECK_FUNCS([statx], [have_statx=yes], [have_statx=no])
+], [
+  have_statx=no
+])
 
 AM_CONDITIONAL([HAVE_OPENAT], [test "x$have_openat" = xyes])
-AM_CONDITIONAL([HAVE_LINUX_LANDLOCK_H], [test "x$ac_cv_header_linux_landlock_h" = xyes])
+AM_CONDITIONAL([HAVE_SYS_PRCTL_H], [test "x$ac_cv_header_sys_prctl_h" = xyes])
 
 have_setns_syscall="yes"
 UL_CHECK_SYSCALL([setns])
@@ -994,6 +1012,21 @@ AS_IF([test "x$build_widechar" = xyes ], [
   AC_DEFINE([HAVE_WIDECHAR], [1], [Do we have wide character support?])
 ])
 
+# The "R" (SHF_GNU_RETAIN) section flag is only understood by binutils >= 2.36.
+AC_MSG_CHECKING([whether the assembler supports the R (SHF_GNU_RETAIN) section flag])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+	__asm__(".pushsection .note.test, \"aR\", %note\n.popsection\n");
+]])], [
+	AC_MSG_RESULT([yes])
+	ul_dlopen_section_flags="aGR"
+], [
+	AC_MSG_RESULT([no])
+	ul_dlopen_section_flags="aG"
+])
+AC_DEFINE_UNQUOTED([_UL_ELF_NOTE_DLOPEN_SECTION_FLAGS],
+	["$ul_dlopen_section_flags"],
+	[ELF section flags for the .note.dlopen ELF note])
+
 
 AC_CHECK_TYPES([cpu_set_t], [have_cpu_set_t=yes], [], [[
 #include <sched.h>
@@ -1086,6 +1119,15 @@ AS_IF([test "x$with_selinux" = xno], [
 ])
 AC_SUBST([SELINUX_LIBS])
 AC_SUBST([SELINUX_LIBS_STATIC])
+
+AC_ARG_ENABLE([selinux-dlopen],
+  AS_HELP_STRING([--enable-selinux-dlopen], [dlopen SELinux at runtime instead of linking]),
+  [], [enable_selinux_dlopen=no])
+AS_IF([test "x$enable_selinux_dlopen" = xyes -a "x$have_selinux" = xyes], [
+  AC_DEFINE([USE_DLOPEN_SELINUX], [1], [Use dlopen for SELinux])
+])
+AM_CONDITIONAL([USE_DLOPEN_SELINUX],
+  [test "x$enable_selinux_dlopen" = xyes -a "x$have_selinux" = xyes])
 
 
 AC_ARG_WITH([audit],
@@ -1339,6 +1381,7 @@ AS_IF([test "x$build_liblastlog2" != xno], [
   PKG_CHECK_MODULES([SQLITE3], [sqlite3], [have_sqlite3=yes], [have_sqlite3=no])
 ])
 UL_REQUIRES_HAVE([liblastlog2], [sqlite3], [sqlite3 library])
+UL_REQUIRES_HAVE([liblastlog2], [lastlog_h], [lastlog.h header file])
 AC_SUBST([SQLITE3_LIBS])
 
 AC_SUBST([LIBLASTLOG2_VERSION])
@@ -1692,6 +1735,28 @@ AS_IF([test "x$with_cap_ng" = xno], [
 AC_SUBST([CAP_NG_LIBS])
 
 
+AC_ARG_WITH([fuse],
+  AS_HELP_STRING([--without-fuse], [compile the test_mkfds helper without libfuse]),
+  [], [with_fuse=auto]
+)
+have_fuse=no
+AS_IF([test "x$with_fuse" = xno], [
+  AM_CONDITIONAL([HAVE_FUSE], [false])
+],[
+  PKG_CHECK_MODULES_STATIC([FUSE], [fuse >= 2.6], [have_fuse=yes], [have_fuse=no])
+  AS_CASE([$with_fuse:$have_fuse],
+    [yes:no],
+      [AC_MSG_ERROR([fuse selected, but required library not found])]
+  )
+  AS_IF([test "x$have_fuse" = xyes], [
+    AC_DEFINE([HAVE_LIBFUSE], [1], [Define if libfuse is available])
+  ])
+  AM_CONDITIONAL([HAVE_FUSE], [test "x$have_fuse" = xyes])
+])
+AC_SUBST([FUSE_CFLAGS])
+AC_SUBST([FUSE_LIBS])
+
+
 AC_ARG_ENABLE([setpriv],
   AS_HELP_STRING([--disable-setpriv], [do not build setpriv]),
   [], [UL_DEFAULT_ENABLE([setpriv], [check])]
@@ -1703,6 +1768,17 @@ UL_REQUIRES_HAVE([setpriv], [linux_securebits_h], [linux/securebits.h header fil
 UL_REQUIRES_HAVE([setpriv], [linux_capability_h], [linux/capability.h header file])
 UL_REQUIRES_HAVE([setpriv], [cap_ng], [libcap-ng library])
 AM_CONDITIONAL([BUILD_SETPRIV], [test "x$build_setpriv" = xyes])
+
+UL_CHECK_SYSCALL([landlock_create_ruleset])
+UL_CHECK_SYSCALL([landlock_add_rule])
+UL_CHECK_SYSCALL([landlock_restrict_self])
+AS_IF([test "x$ul_cv_syscall_landlock_create_ruleset" != xno &&
+       test "x$ul_cv_syscall_landlock_add_rule" != xno &&
+       test "x$ul_cv_syscall_landlock_restrict_self" != xno],
+      [have_landlock=yes], [have_landlock=no])
+AM_CONDITIONAL([HAVE_LANDLOCK], [test "x$have_landlock" = xyes])
+AS_IF([test "x$have_landlock" = xyes],
+      [AC_DEFINE([HAVE_LANDLOCK], [1], [Define if Landlock syscalls are available])])
 
 AC_ARG_ENABLE([hardlink],
   AS_HELP_STRING([--disable-hardlink], [do not build hardlink]),
@@ -2038,7 +2114,11 @@ AS_IF([test "x$build_enosys" = xyes], [
 ])
 AM_CONDITIONAL([BUILD_ENOSYS], [test "x$build_enosys" = xyes])
 
-UL_BUILD_INIT([lsclocks], [check])
+AC_ARG_ENABLE([lsclocks],
+  AS_HELP_STRING([--disable-lsclocks], [do not build lsclocks]),
+  [], [UL_DEFAULT_ENABLE([lsclocks], [check])]
+)
+UL_BUILD_INIT([lsclocks])
 UL_REQUIRES_LINUX([lsclocks])
 UL_REQUIRES_BUILD([lsclocks], [libsmartcols])
 AM_CONDITIONAL([BUILD_LSCLOCKS], [test "x$build_lsclocks" = xyes])
@@ -2737,7 +2817,6 @@ AC_ARG_WITH([systemd],
 
 have_systemd=no
 AS_IF([test "x$with_systemd" != xno], [
-  # new version -- all libsystemd-* libs merged into libsystemd
   # if 257 or newer, use locked system user accounts
   PKG_CHECK_MODULES([SYSTEMD], [libsystemd >= 257], [
       have_systemd=yes
@@ -2745,15 +2824,6 @@ AS_IF([test "x$with_systemd" != xno], [
     ], [
       SYSTEMD_USER_LOCK=
       PKG_CHECK_MODULES([SYSTEMD], [libsystemd], [have_systemd=yes], [have_systemd=no])
-  ])
-  # old versions
-  AS_IF([test "x$have_systemd" != "xyes"], [
-    PKG_CHECK_MODULES([SYSTEMD_DAEMON], [libsystemd-daemon],
-		      [have_systemd_daemon=yes], [have_systemd_daemon=no])
-    PKG_CHECK_MODULES([SYSTEMD_JOURNAL], [libsystemd-journal],
-		      [have_systemd_journal=yes], [have_systemd_journal=no])
-    AS_IF([test "x$have_systemd_daemon" = "xyes" && test "x$have_systemd_journal" = "xyes" ],[
-	   have_systemd=yes])
   ])
   AS_CASE([$with_systemd:$have_systemd],
     [yes:no],
@@ -2768,6 +2838,15 @@ AS_IF([test "x$with_systemd" != xno], [
   )
 ])
 AM_CONDITIONAL([HAVE_SYSTEMD], [test "x$have_systemd" = xyes])
+
+AC_ARG_ENABLE([systemd-dlopen],
+  AS_HELP_STRING([--enable-systemd-dlopen], [dlopen systemd at runtime instead of linking]),
+  [], [enable_systemd_dlopen=no])
+AS_IF([test "x$enable_systemd_dlopen" = xyes -a "x$have_systemd" = xyes], [
+  AC_DEFINE([USE_DLOPEN_SYSTEMD], [1], [Use dlopen for systemd])
+])
+AM_CONDITIONAL([USE_DLOPEN_SYSTEMD],
+  [test "x$enable_systemd_dlopen" = xyes -a "x$have_systemd" = xyes])
 
 libmount_udev_support=no
 AS_IF([test "x$enable_libmount_udev_support" != xno && test "x$build_libmount" = xyes], [
@@ -2828,15 +2907,6 @@ AS_IF([test "x$with_sysusersdir" != "xno"], [
 ])
 
 
-AC_ARG_WITH([ntfs-mounttype],
-  AS_HELP_STRING([--with-ntfs-mounttype=TYPE], [overwrite default ntfs3 mount type for NTFS]),
-  [], [with_ntfs_mounttype=no]
-)
-AS_IF([test "x$with_ntfs_mounttype" != "xno"], [
-  AC_DEFINE_UNQUOTED([CONFIG_UL_NTFS_MOUNTTYPE], ["$with_ntfs_mounttype"], [NTFS mounttype])
-])
-
-
 AC_ARG_WITH([smack],
   AS_HELP_STRING([--with-smack], [build with SMACK support]),
   [], [with_smack=no]
@@ -2863,11 +2933,21 @@ AS_IF([test "x$with_econf" != xno], [
   AS_CASE([$with_econf:$have_econf],
     [yes:no],
       [AC_MSG_ERROR([libeconf expected but libeconf not found])],
-    [*:yes],
+    [*:yes], [
        AC_DEFINE([HAVE_LIBECONF], [1], [Define if libeconf is available])
+    ]
   )
 ])
 AM_CONDITIONAL([HAVE_ECONF], [test "x$have_econf" = xyes])
+
+AC_ARG_ENABLE([econf-dlopen],
+  AS_HELP_STRING([--enable-econf-dlopen], [dlopen econf at runtime instead of linking]),
+  [], [enable_econf_dlopen=no])
+AS_IF([test "x$enable_econf_dlopen" = xyes -a "x$have_econf" = xyes], [
+  AC_DEFINE([USE_DLOPEN_ECONF], [1], [Use dlopen for econf])
+])
+AM_CONDITIONAL([USE_DLOPEN_ECONF],
+  [test "x$enable_econf_dlopen" = xyes -a "x$have_econf" = xyes])
 
 AC_ARG_WITH([vendordir],
   AS_HELP_STRING([--with-vendordir=DIR], [Directory for distribution provided configuration files]),
@@ -3077,7 +3157,6 @@ AC_ARG_WITH([cryptsetup],
 
 AS_IF([test "x$with_cryptsetup" = xno], [
   AM_CONDITIONAL([HAVE_CRYPTSETUP], [false])
-  AM_CONDITIONAL([CRYPTSETUP_VIA_DLOPEN], [false])
 ], [
   PKG_CHECK_MODULES([CRYPTSETUP], [libcryptsetup],
 	[AC_DEFINE([HAVE_CRYPTSETUP], [1], [Define if cryptsetup is available])
@@ -3090,21 +3169,11 @@ AS_IF([test "x$with_cryptsetup" = xno], [
 	 AC_CHECK_LIB([cryptsetup], [crypt_activate_by_signed_key], [
 	  AC_DEFINE([HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY], [1], [Define if crypt_activate_by_signed_key exist in -lcryptsetup])
 	 ])
-	 AS_IF([test "x$with_cryptsetup" = xdlopen], [
-	  LIBS="-ldl $LIBS"
-	  AC_CHECK_LIB([dl], [dlsym], [
-	    AC_DEFINE([CRYPTSETUP_VIA_DLOPEN], [1], [Define if cryptsetup is to be loaded via dlopen])
-	    AM_CONDITIONAL([CRYPTSETUP_VIA_DLOPEN], [true])
-	   ], [AC_MSG_ERROR([libdl required to build with cryptsetup support])])
-	 ], [
-	  AM_CONDITIONAL([CRYPTSETUP_VIA_DLOPEN], [false])
-	 ])
 	 CFLAGS="$SAVE_CFLAGS"
 	 LIBS="$SAVE_LIBS"
 	 have_cryptsetup=yes],
 	[have_cryptsetup=no
    AM_CONDITIONAL([HAVE_CRYPTSETUP], [false])
-   AM_CONDITIONAL([CRYPTSETUP_VIA_DLOPEN], [false])
   ])
 
   AS_CASE([$with_cryptsetup:$have_cryptsetup],
@@ -3113,6 +3182,15 @@ AS_IF([test "x$with_cryptsetup" = xno], [
 ])
 AC_SUBST([CRYPTSETUP_LIBS])
 AC_SUBST([CRYPTSETUP_LIBS_STATIC])
+
+AC_ARG_ENABLE([cryptsetup-dlopen],
+  AS_HELP_STRING([--enable-cryptsetup-dlopen], [dlopen cryptsetup at runtime instead of linking]),
+  [], [enable_cryptsetup_dlopen=no])
+AS_IF([test "x$enable_cryptsetup_dlopen" = xyes -a "x$have_cryptsetup" = xyes], [
+  AC_DEFINE([USE_DLOPEN_CRYPTSETUP], [1], [Use dlopen for cryptsetup])
+])
+AM_CONDITIONAL([USE_DLOPEN_CRYPTSETUP],
+  [test "x$enable_cryptsetup_dlopen" = xyes -a "x$have_cryptsetup" = xyes])
 
 
 AC_ARG_VAR([SUID_CFLAGS],

@@ -19,21 +19,27 @@
 #include "agetty.h"
 #include "c.h"
 #include "color-names.h"
+#include "configs.h"
 #include "nls.h"
 #include "fileutils.h"
 #include "pathnames.h"
 #include "widechar.h"
+#include "strutils.h"
+
+/* The default issue file (e.g. /etc/issue) is read via ul_configs_file_list()
+ * whenever ISSUE_SUPPORT is enabled. The drop-in directory (issue.d) scanning
+ * performed by that function additionally requires ISSUEDIR_SUPPORT
+ * (i.e. scandirat()/openat()); when it is unavailable ul_configs_file_list()
+ * still returns the main issue file. */
+#define ISSUEDIR_EXT	"issue"
+#define ISSUEDIR_EXTSIZ	sizeof(ISSUEDIR_EXT)
 
 #ifdef ISSUEDIR_SUPPORT
-# include "configs.h"
 # include <dirent.h>
-# define ISSUEDIR_EXT	"issue"
-# define ISSUEDIR_EXTSIZ	sizeof(ISSUEDIR_EXT)
 #endif
 
 #ifdef USE_SYSTEMD
-# include <systemd/sd-daemon.h>
-# include <systemd/sd-login.h>
+# include "dl-systemd.h"
 #endif
 
 #ifdef USE_NETLINK
@@ -69,7 +75,7 @@ static char *read_os_release(struct agetty_options *op, const char *varname)
 		op->osrelease = malloc(st.st_size + 1);
 		if (!op->osrelease)
 			agetty_log_err(_("failed to allocate memory: %m"));
-		if (read_all(fd, op->osrelease, st.st_size) != (ssize_t) st.st_size) {
+		if (ul_read_all(fd, op->osrelease, st.st_size) != (ssize_t) st.st_size) {
 			free(op->osrelease);
 			op->osrelease = NULL;
 			goto done;
@@ -82,7 +88,7 @@ static char *read_os_release(struct agetty_options *op, const char *varname)
 	p = buf;
 
 	for (;;) {
-		char *eol, *eon;
+		char *eol;
 
 		p += strspn(p, "\n\r");
 		p += strspn(p, " \t\n\r");
@@ -102,21 +108,14 @@ static char *read_os_release(struct agetty_options *op, const char *varname)
 		if (*p != '=')
 			continue;
 
-		p += strspn(p, " \t\n\r=\"");
+		p += strspn(p, " \t\n\r=");
+
 		eol = p + strcspn(p, "\n\r");
 		*eol = '\0';
-		eon = eol-1;
-		while (eon > p) {
-			if (*eon == '\t' || *eon == ' ') {
-				eon--;
-				continue;
-			}
-			if (*eon == '"') {
-				*eon = '\0';
-				break;
-			}
-			break;
-		}
+
+		rtrim_whitespace((unsigned char *) p);
+		ul_unquote(p);
+
 		free(ret);
 		ret = strdup(p);
 		if (!ret)
@@ -210,7 +209,7 @@ void agetty_print_issue_file(struct agetty_issue *ie __attribute__((__unused__))
 {
 	if ((op->flags & F_NONL) == 0) {
 		/* Issue not in use, start with a new line. */
-		write_all(STDOUT_FILENO, "\r\n", 2);
+		ul_write_all(STDOUT_FILENO, "\r\n", 2);
 	}
 }
 
@@ -292,7 +291,7 @@ void agetty_print_issue_file(struct agetty_issue *ie,
 
 	if ((op->flags & F_NONL) == 0) {
 		/* Issue not in use, start with a new line. */
-		write_all(STDOUT_FILENO, "\r\n", 2);
+		ul_write_all(STDOUT_FILENO, "\r\n", 2);
 	}
 
 	if (ie->do_tcsetattr) {
@@ -304,7 +303,7 @@ void agetty_print_issue_file(struct agetty_issue *ie,
 	}
 
 	if (ie->mem_sz && ie->mem)
-		write_all(STDOUT_FILENO, ie->mem, ie->mem_sz);
+		ul_write_all(STDOUT_FILENO, ie->mem, ie->mem_sz);
 
 	if (ie->do_tcrestore) {
 		/* Restore settings. */
@@ -393,7 +392,6 @@ skip:
 		goto done;
 	}
 
-#ifdef ISSUEDIR_SUPPORT
 	struct list_head file_list;
 	struct list_head *current = NULL;
 	char *name = NULL;
@@ -403,6 +401,11 @@ skip:
 	 * https://github.com/uapi-group/specifications/blob/main/specs/configuration_files_specification.md
 	 *
 	 * Note that _PATH_RUNSTATEDIR (/run) is always read by ul_configs_file_list().
+	 *
+	 * ul_configs_file_list() returns the main issue file (e.g. /etc/issue)
+	 * even when drop-in directory support (ISSUEDIR_SUPPORT) is unavailable,
+	 * so the default issue file is still shown on builds without issue.d
+	 * support.
 	 */
 	ul_configs_file_list(&file_list,
 			     NULL,
@@ -417,7 +420,6 @@ skip:
 	}
 
 	ul_configs_free_list(&file_list);
-#endif
 
 done:
 	if (ie->output) {
@@ -446,7 +448,7 @@ void agetty_show_issue(struct agetty_options *op)
 	agetty_eval_issue_file(&ie, op, &tp);
 
 	if (ie.mem_sz)
-		write_all(STDOUT_FILENO, ie.mem, ie.mem_sz);
+		ul_write_all(STDOUT_FILENO, ie.mem, ie.mem_sz);
 	if (ie.output)
 		fclose(ie.output);
 	free(ie.mem);
@@ -782,8 +784,8 @@ static void output_special_char(struct agetty_issue *ie,
 	{
 		int users = 0;
 #ifdef USE_SYSTEMD
-		if (sd_booted() > 0) {
-			users = sd_get_sessions(NULL);
+		if (ul_dlopen_libsystemd() == 0 && systemd_call(sd_booted)() > 0) {
+			users = systemd_call(sd_get_sessions)(NULL);
 			if (users < 0)
 				users = 0;
 		} else

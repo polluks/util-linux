@@ -1,0 +1,91 @@
+# AGENTS.md
+
+This file provides guidance to AI coding agents working on this repository.
+
+util-linux is a collection of essential Linux system utilities and libraries
+(libmount, libblkid, libsmartcols, libfdisk, libuuid). The project follows
+Linux kernel coding conventions and workflows.
+
+## Legal
+
+Only human beings can be credited as authors. Do not use Co-Developed-By,
+Co-Authored-By, or similar authorship attribution for AI models — authorship
+carries responsibility for the origin of the patch, which a model cannot take.
+
+Disclosing tool use with an `Assisted-by:` trailer is welcome, but not
+required. It does not change the standard the patch is held to.
+
+Commits must include a Signed-off-by line (`git commit -s`) from the human
+submitter, who is responsible for the patch and is expected to understand and
+be able to defend every line of it.
+
+## Key Documentation
+
+Always consult these files as needed:
+
+- `Documentation/HOWTO-BUILDING.md` — how to compile the project, build system internals
+- `Documentation/HOWTO-CONTRIBUTING.md` — contribution guidelines, patch and PR workflow
+- `Documentation/HOWTO-HACKING.md` — coding details: usage functions, man pages, debugging
+- `Documentation/HOWTO-TESTING.md` — regression test framework, environment variables
+
+## Code Style
+
+The coding style is based on the Linux kernel coding style.
+
+- Do NOT use `{ }` braces for single-line if/else blocks.
+- Do not use `else` after non-returning functions (err(), errx(), exit(), ...).
+- Avoid `if ((rc = func()) != 0)` — split into separate assignment and comparison:
+  ```c
+  rc = func();
+  if (rc != 0)
+  ```
+- Use `printf()` consistently, not `fprintf(stdout, ...)`.
+- Follow existing naming and coding conventions in each file.
+- Use EditorConfig (`.editorconfig` in the project root) for whitespace settings.
+
+## Function Return Conventions
+
+- Boolean functions return true/false — name with `_is_`, `_has_`, `_can_`.
+- Iterator `_next_` functions: 0 = success, <0 = error, 1 = end of list.
+- Error-returning functions: negative errno or NULL.
+- Check existing similar functions in libsmartcols, libmount for API consistency.
+
+## Memory Management
+
+- For non-library code, use `include/xalloc.h` wrappers (`xmalloc()`, `xcalloc()`,
+  `xstrdup()`, etc.) — these always succeed or terminate with `err()`.
+- In libraries, check ownership semantics: does the function take ownership or copy?
+- Trace every `malloc`/`calloc`/`strdup`/`asprintf` to its corresponding `free()`.
+- `list_del()` must also free the element memory, not just unlink.
+- Watch for missing `free()` on error/early-return paths.
+
+## Commit Messages
+
+- Use `Fixes:` when the commit resolves an issue.
+- Use `Addresses:` when the commit only partly implements requested changes.
+- Always use complete GitHub URLs, for example:
+  `Fixes: https://github.com/util-linux/util-linux/issues/NNN`
+- Do not commit generated files (po/, po-man/, ./configure, ...).
+
+## Build and Test
+
+The project supports two build systems: autotools and meson.
+
+Autotools:
+
+- Build: `./autogen.sh && ./configure && make`
+- Run tests: `make check` or `cd tests && ./run.sh`
+- Selective build: `./configure --disable-all-programs --enable-<name>`
+
+Meson:
+
+- Build: `meson setup build && meson compile -C build`
+- Run tests: `meson test -C build`
+
+Tests:
+
+- Use `./tests/run.sh` to execute all tests.
+- Use `./tests/run.sh <subsystem> ...` to test specified subsystems (e.g., `run.sh mount more`). The subsystem name is based on the directory name; see `tests/ts/*`.
+- Use `./tests/ts/<subsystem>/<scriptname>` to directly call a script test. Do not use the `run.sh` wrapper in this case.
+
+Features should include corresponding tests.

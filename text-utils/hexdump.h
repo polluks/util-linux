@@ -87,6 +87,7 @@ struct hexdump {
   struct list_head fshead;				/* head of format strings */
   ssize_t blocksize;			/* data block size */
   int exitval;				/* final exit value */
+  int stdout_errno;			/* errno from stdout error */
   ssize_t length;			/* max bytes to read */
   off_t skip;				/* bytes to skip */
   /* Sparse file optimization using FIEMAP (Linux only) */
@@ -111,6 +112,7 @@ void __attribute__((__noreturn__)) usage(void);
 void conv_c(struct hexdump_pr *, u_char *);
 void conv_u(struct hexdump_pr *, u_char *);
 int  next(char **, struct hexdump *);
+void free_colorlist(struct list_head *);
 int parse_args(int, char **, struct hexdump *);
 
 #endif /* UTIL_LINUX_HEXDUMP_H */

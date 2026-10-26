@@ -6,7 +6,14 @@ option('ncurses',     type : 'feature')
 option('slang',       type : 'feature', value : 'disabled',
        description : 'compile cfdisk with slang rather than ncurses')
 option('cryptsetup',  type : 'feature')
-option('cryptsetup-dlopen',  type : 'feature')
+option('selinux-dlopen', type : 'boolean', value : false,
+       description : 'dlopen SELinux at runtime instead of linking')
+option('cryptsetup-dlopen', type : 'boolean', value : false,
+       description : 'dlopen cryptsetup at runtime instead of linking')
+option('systemd-dlopen', type : 'boolean', value : false,
+       description : 'dlopen systemd at runtime instead of linking')
+option('econf-dlopen', type : 'boolean', value : false,
+       description : 'dlopen econf at runtime instead of linking')
 option('zlib',        type : 'feature')
 option('readline',    type : 'feature')
 option('nls',         type : 'feature')
@@ -27,6 +34,8 @@ option('widechar',    type : 'feature',
        description : 'compile with wide character support')
 option('translate-docs', type : 'feature',
        description : 'translate documentation')
+option('fuse',           type : 'feature',
+       description : 'build the test_mkfds helper with libfuse')
 
 # enable building of various programs and features ("build-" prefix)
 
@@ -322,10 +331,6 @@ option('build-libmount-udev-support',
        type : 'feature',
        description : 'support reading from udev in libmount')
 
-option('ntfs-mounttype',
-       type : 'string',
-       description : 'overwrite default ntfs3 mount type for NTFS')
-
 option('vendordir',
        type: 'string',
        description : 'directory for distribution provided econf files')
@@ -338,6 +343,9 @@ option('login-lastlogin', type : 'boolean',
 option('login-stat-mail', type : 'boolean',
        value : false,
        description : 'let login stat() the mailbox')
+option('login-chown-vcs', type : 'boolean',
+       value : false,
+       description : 'let login chown /dev/vcsN')
 option('hwclock-gplv3', type : 'boolean',
        value : true,
        description : 'use datetime parsing GPLv3 code for hwclock')

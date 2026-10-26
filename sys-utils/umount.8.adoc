@@ -87,7 +87,9 @@ A system reboot would be expected in near future if you're going to use this opt
 *-N*, *--namespace* _ns_::
 Perform *umount* in the mount namespace specified by _ns_. _ns_ is either PID of process running in that namespace or special file representing that namespace.
 +
-*umount* switches to the namespace when it reads _/etc/fstab_, writes _/etc/mtab_ (or writes to _/run/mount_) and calls *umount*(2) system call, otherwise it runs in the original namespace. It means that the target mount namespace does not have to contain any libraries or other requirements necessary to execute *umount*(2) command.
+*umount* switches to the namespace when it reads _/etc/fstab_, writes _/etc/mtab_ (or writes to _/run/mount_), resolves paths and reads mount information for *--recursive* or *--all-targets*, and calls the *umount*(2) system call. Otherwise it runs in the original namespace. The target mount namespace does not have to contain any libraries or other requirements necessary to execute the *umount* command.
++
+Switching to the target mount namespace resets the root and working directories to that namespace's root directory. Relative path arguments are therefore resolved from the target namespace's _/_ directory, including with *--recursive* and *--all-targets*.
 +
 See *mount_namespaces*(7) for more information.
 
@@ -104,7 +106,7 @@ Suppress "not mounted" error messages.
 Exit successfully even if the target is not mounted or does not exist. This option is designed for use in shutdown scripts and service managers where idempotent unmount behavior is desired. Only effective for the root user.
 
 *-R*, *--recursive*::
-Recursively unmount each specified directory. Recursion for each directory will stop if any unmount operation in the chain fails for any reason. The relationship between mountpoints is determined by _/proc/self/mountinfo_ entries. The filesystem must be specified by mountpoint path; a recursive unmount by device name (or UUID) is unsupported. Since version 2.37 it umounts also all over-mounted filesystems (more filesystems on the same mountpoint).
+Recursively unmount each specified directory. Recursion for each directory will stop if any unmount operation in the chain fails for any reason. The relationship between mountpoints is determined by _/proc/self/mountinfo_ entries. The filesystem must be specified by path; a recursive unmount by device name (or UUID) is unsupported. Since version 2.37 it umounts also all over-mounted filesystems (more filesystems on the same mountpoint). Since version 2.43, if the specified directory is not a mountpoint, then all filesystems mounted below the directory are unmounted. In this case each subtree below the directory is processed independently, so a failure in one subtree does not prevent the remaining subtrees from being unmounted.
 
 *-r*, *--read-only*::
 When an unmount fails, try to remount the filesystem read-only.
@@ -176,7 +178,7 @@ ____
 **umount.**__suffix__ {__directory__|_device_} [*-flnrv*] [*-N* _namespace_] [*-t* _type_._subtype_]
 ____
 
-where _suffix_ is the filesystem type (or the value from a *uhelper=* or *helper=* marker in the mtab file). The *-t* option can be used for filesystems that have subtype support. For example:
+where _suffix_ is the filesystem type (or the value from a *uhelper=* or *helper=* marker in the mtab file, or from the *helper* setting in _/etc/mount/fs.d/_**__type__**_.conf_; see *CONFIG FILE* in *mount*(8)). The *-t* option can be used for filesystems that have subtype support. For example:
 
 ____
 *umount.fuse -t fuse.sshfs*

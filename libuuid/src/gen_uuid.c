@@ -96,6 +96,13 @@
 #include "sha1.h"
 #include "timeutils.h"
 
+/*
+ * SOCK_CLOEXEC is not available everywhere (e.g. macOS); the sockets below
+ * are short-lived, so silently fall back to no flag.
+ */
+#ifndef SOCK_CLOEXEC
+# define SOCK_CLOEXEC 0
+#endif
 
 #ifdef _WIN32
 static void gettimeofday (struct timeval *tv, void *dummy)
@@ -108,11 +115,11 @@ static void gettimeofday (struct timeval *tv, void *dummy)
 	     + (uint64_t) ftime.dwLowDateTime);
 	if (n) {
 		n /= 10;
-		n -= ((369 * 365 + 89) * (uint64_t) 86400) * 1000000;
+		n -= ((369 * 365 + 89) * (uint64_t) 86400) * USEC_PER_SEC;
 	}
 
-	tv->tv_sec = n / 1000000;
-	tv->tv_usec = n % 1000000;
+	tv->tv_sec = n / USEC_PER_SEC;
+	tv->tv_usec = n % USEC_PER_SEC;
 }
 
 static int getuid (void)
@@ -166,7 +173,7 @@ static int get_node_id(unsigned char *node_id)
 #define ifreq_size(i) sizeof(struct ifreq)
 #endif /* HAVE_SA_LEN */
 
-	sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+	sd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_IP);
 	if (sd < 0) {
 		return -1;
 	}
@@ -337,8 +344,8 @@ try_again:
 		adjustment += *num - 1;
 		last.tv_usec += adjustment / 10;
 		adjustment = adjustment % 10;
-		last.tv_sec += last.tv_usec / 1000000;
-		last.tv_usec = last.tv_usec % 1000000;
+		last.tv_sec += last.tv_usec / USEC_PER_SEC;
+		last.tv_usec = last.tv_usec % USEC_PER_SEC;
 	}
 
 	if (state_fd >= 0) {
@@ -487,7 +494,7 @@ static int get_uuid_via_daemon(int op, uuid_t out, int *num)
 	if (sizeof(UUIDD_SOCKET_PATH) > sizeof(srv_addr.sun_path))
 		return -1;
 
-	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+	if ((s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
 		return -1;
 
 	srv_addr.sun_family = AF_UNIX;
@@ -509,14 +516,14 @@ static int get_uuid_via_daemon(int op, uuid_t out, int *num)
 	if (ret < 1)
 		goto fail;
 
-	ret = read_all(s, (char *) &reply_len, sizeof(reply_len));
+	ret = ul_read_all(s, (char *) &reply_len, sizeof(reply_len));
 	if (ret < 0)
 		goto fail;
 
 	if (reply_len != expected)
 		goto fail;
 
-	ret = read_all(s, op_buf, reply_len);
+	ret = ul_read_all(s, op_buf, reply_len);
 
 	if (op == UUIDD_OP_BULK_TIME_UUID)
 		memcpy(op_buf+16, num, sizeof(int));

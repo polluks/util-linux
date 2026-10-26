@@ -70,8 +70,8 @@
 #include <termios.h>
 #include <sys/stat.h>
 #include <getopt.h>
-#include <err.h>
 
+#include "c.h"
 #include "blkdev.h"
 #include "minix_programs.h"
 #include "nls.h"
@@ -196,30 +196,30 @@ static void write_tables(const struct fs_control *ctl)
 	if (lseek(ctl->device_fd, 0, SEEK_SET))
 		err(MKFS_EX_ERROR, _("%s: seek to boot block failed "
 				   "in write_tables"), ctl->device_name);
-	if (write_all(ctl->device_fd, boot_block_buffer, 512))
+	if (ul_write_all(ctl->device_fd, boot_block_buffer, 512))
 		err(MKFS_EX_ERROR, _("%s: unable to clear boot sector"), ctl->device_name);
 	if (MINIX_BLOCK_SIZE != lseek(ctl->device_fd, MINIX_BLOCK_SIZE, SEEK_SET))
 		err(MKFS_EX_ERROR, _("%s: seek failed in write_tables"), ctl->device_name);
 
-	if (write_all(ctl->device_fd, super_block_buffer, MINIX_BLOCK_SIZE))
+	if (ul_write_all(ctl->device_fd, super_block_buffer, MINIX_BLOCK_SIZE))
 		err(MKFS_EX_ERROR, _("%s: unable to write super-block"), ctl->device_name);
 
-	if (write_all(ctl->device_fd, inode_map, imaps * MINIX_BLOCK_SIZE))
+	if (ul_write_all(ctl->device_fd, inode_map, imaps * MINIX_BLOCK_SIZE))
 		err(MKFS_EX_ERROR, _("%s: unable to write inode map"), ctl->device_name);
 
-	if (write_all(ctl->device_fd, zone_map, zmaps * MINIX_BLOCK_SIZE))
+	if (ul_write_all(ctl->device_fd, zone_map, zmaps * MINIX_BLOCK_SIZE))
 		err(MKFS_EX_ERROR, _("%s: unable to write zone map"), ctl->device_name);
 
-	if (write_all(ctl->device_fd, inode_buffer, buffsz))
+	if (ul_write_all(ctl->device_fd, inode_buffer, buffsz))
 		err(MKFS_EX_ERROR, _("%s: unable to write inodes"), ctl->device_name);
 }
 
 static void write_block(const struct fs_control *ctl, int blk, char * buffer)
 {
-	if (blk * MINIX_BLOCK_SIZE != lseek(ctl->device_fd, blk * MINIX_BLOCK_SIZE, SEEK_SET))
+	if ((off_t) blk * MINIX_BLOCK_SIZE != lseek(ctl->device_fd, (off_t) blk * MINIX_BLOCK_SIZE, SEEK_SET))
 		errx(MKFS_EX_ERROR, _("%s: seek failed in write_block"), ctl->device_name);
 
-	if (write_all(ctl->device_fd, buffer, MINIX_BLOCK_SIZE))
+	if (ul_write_all(ctl->device_fd, buffer, MINIX_BLOCK_SIZE))
 		errx(MKFS_EX_ERROR, _("%s: write failed in write_block"), ctl->device_name);
 }
 
@@ -595,8 +595,8 @@ static size_t do_check(const struct fs_control *ctl, char * buffer, int try, uns
 	ssize_t got;
 
 	/* Seek to the correct loc. */
-	if (lseek(ctl->device_fd, current_block * MINIX_BLOCK_SIZE, SEEK_SET) !=
-		       current_block * MINIX_BLOCK_SIZE )
+	if (lseek(ctl->device_fd, (off_t) current_block * MINIX_BLOCK_SIZE, SEEK_SET) !=
+		       (off_t) current_block * MINIX_BLOCK_SIZE)
 		err(MKFS_EX_ERROR, _("%s: seek failed during testing of blocks"),
 				ctl->device_name);
 
@@ -631,8 +631,8 @@ static void check_blocks(struct fs_control *ctl)
 	sigaction(SIGALRM, &sa, &old);
 	alarm(5);
 	while (currently_testing < zones) {
-		if (lseek(ctl->device_fd, currently_testing * MINIX_BLOCK_SIZE,SEEK_SET) !=
-		    currently_testing*MINIX_BLOCK_SIZE)
+		if (lseek(ctl->device_fd, (off_t) currently_testing * MINIX_BLOCK_SIZE, SEEK_SET) !=
+		    (off_t) currently_testing * MINIX_BLOCK_SIZE)
 			errx(MKFS_EX_ERROR, _("%s: seek failed in check_blocks"),
 					ctl->device_name);
 		try = TEST_BUFFER_BLOCKS;
@@ -677,6 +677,11 @@ static void get_list_blocks(struct fs_control *ctl, char *filename)
 			errx(MKFS_EX_ERROR, _("%s: cannot read badblocks file"),
 					ctl->device_name);
 		}
+		if (blockno < (unsigned long) get_first_zone() ||
+		    blockno >= get_nzones())
+			errx(MKFS_EX_ERROR,
+			     _("%s: bad block number %lu is outside of the file system"),
+			     ctl->device_name, blockno);
 		mark_zone(blockno);
 		ctl->fs_bad_blocks++;
 	}
@@ -706,7 +711,7 @@ static int find_super_magic(const struct fs_control *ctl)
 
 static void determine_device_blocks(struct fs_control *ctl, const struct stat *statbuf)
 {
-	unsigned long long dev_blocks = 0;
+	uint64_t dev_blocks = 0;
 
 	if (S_ISBLK(statbuf->st_mode)) {
 		int sectorsize;
@@ -725,8 +730,9 @@ static void determine_device_blocks(struct fs_control *ctl, const struct stat *s
 		ctl->fs_blocks = dev_blocks;
 	else if (dev_blocks < ctl->fs_blocks)
 		errx(MKFS_EX_ERROR,
-		     _("%s: requested blocks (%llu) exceeds available (%llu) blocks"),
-		     ctl->device_name, ctl->fs_blocks, dev_blocks);
+		     _("%s: requested blocks (%ju) exceeds available (%ju) blocks"),
+		     ctl->device_name, (uintmax_t) ctl->fs_blocks,
+		     (uintmax_t) dev_blocks);
 	if (ctl->fs_blocks < 10)
 		errx(MKFS_EX_ERROR, _("%s: number of blocks too small"), ctl->device_name);
 	if (fs_version == 1 && ctl->fs_blocks > MINIX_MAX_INODES)

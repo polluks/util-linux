@@ -160,7 +160,7 @@ int mnt_table_listmount_set_id(struct libmnt_table *tb, uint64_t id)
 /**
  * mnt_table_listmount_set_ns:
  * @tb: mount table
- * @id: namespace ID
+ * @ns: namespace ID
  *
  * Set namespace ID for listmount().
  *
@@ -221,7 +221,7 @@ int mnt_table_reset_listmount(struct libmnt_table *tb)
  *
  * Enable or disable on-demand listmount() to make it usable by
  * mnt_table_next_fs(). This function does not affect
- * mnt_table_fetch_listmont().
+ * mnt_table_fetch_listmount().
  *
  * Returns: old status (1 or 0)
  * Since: 2.41
@@ -407,6 +407,10 @@ int mnt_table_fetch_listmount(struct libmnt_table *tb)
 	/* Avoid using on-demand mnt_table_next_lsmnt() if we already
 	 * have all the necessary data (or on error) */
 	tb->lsmnt->done = 1;
+
+	/* merge userspace mount options from utab */
+	if (rc == 0)
+		rc = mnt_table_merge_utab(tb, NULL);
 
 	/* restore */
 	if (tb->stmnt)

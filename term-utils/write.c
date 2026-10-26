@@ -57,8 +57,7 @@
 #include <utmpx.h>
 
 #if defined(USE_SYSTEMD) && HAVE_DECL_SD_SESSION_GET_USERNAME == 1
-# include <systemd/sd-login.h>
-# include <systemd/sd-daemon.h>
+# include "dl-systemd.h"
 #endif
 
 #include "c.h"
@@ -139,9 +138,9 @@ static int check_utmp(const struct write_control *ctl)
 	struct utmpx *u;
 	int res = 1;
 #if defined(USE_SYSTEMD) && HAVE_DECL_SD_SESSION_GET_USERNAME == 1
-	if (sd_booted() > 0) {
+	if (ul_dlopen_libsystemd() == 0 && systemd_call(sd_booted)() > 0) {
 		char **sessions_list;
-		int sessions = sd_get_sessions(&sessions_list);
+		int sessions = systemd_call(sd_get_sessions)(&sessions_list);
 
 		if (sessions < 0)
 			goto utmp;
@@ -149,9 +148,9 @@ static int check_utmp(const struct write_control *ctl)
 		for (int i = 0; i < sessions; i++) {
 			char *name, *tty;
 
-			if (sd_session_get_username(sessions_list[i], &name) < 0)
+			if (systemd_call(sd_session_get_username)(sessions_list[i], &name) < 0)
 				continue;
-			if (sd_session_get_tty(sessions_list[i], &tty) < 0) {
+			if (systemd_call(sd_session_get_tty)(sessions_list[i], &tty) < 0) {
 				free(name);
 				continue;
 			}
@@ -214,10 +213,10 @@ static void search_utmp(struct write_control *ctl)
 	int num_ttys = 0, valid_ttys = 0, tty_writeable = 0, user_is_me = 0;
 
 #if defined(USE_SYSTEMD) && HAVE_DECL_SD_SESSION_GET_USERNAME == 1
-	if (sd_booted() > 0) {
+	if (ul_dlopen_libsystemd() == 0 && systemd_call(sd_booted)() > 0) {
 		char path[256];
 		char **sessions_list;
-		int sessions = sd_get_sessions(&sessions_list);
+		int sessions = systemd_call(sd_get_sessions)(&sessions_list);
 
 		if (sessions < 0)
 			goto utmp;
@@ -225,13 +224,13 @@ static void search_utmp(struct write_control *ctl)
 		for (int i = 0; i < sessions; i++) {
 			char *name, *tty;
 
-			if (sd_session_get_username(sessions_list[i], &name) < 0)
+			if (systemd_call(sd_session_get_username)(sessions_list[i], &name) < 0)
 				continue;
 			if (strcmp(ctl->dst_login, name) != 0) {
 				free(name);
 				continue;
 			}
-			if (sd_session_get_tty(sessions_list[i], &tty) < 0) {
+			if (systemd_call(sd_session_get_tty)(sessions_list[i], &tty) < 0) {
 				free(name);
 				continue;
 			}
@@ -350,6 +349,7 @@ static void do_write(const struct write_control *ctl)
 	time_t now;
 	struct tm *tm;
 	char *host, *line = NULL;
+	char buf[512];
 	size_t linelen = 0;
 	struct sigaction sigact;
 
@@ -379,14 +379,15 @@ static void do_write(const struct write_control *ctl)
 	/* print greeting */
 	printf("\r\n\a\a\a");
 	if (strcmp(login, pwuid) != 0)
-		printf(_("Message from %s@%s (as %s) on %s at %02d:%02d ..."),
+		snprintf(buf, sizeof(buf), _("Message from %s@%s (as %s) on %s at %02d:%02d ..."),
 		       login, host, pwuid, ctl->src_tty_name,
 		       tm->tm_hour, tm->tm_min);
 	else
-		printf(_("Message from %s@%s on %s at %02d:%02d ..."),
+		snprintf(buf, sizeof(buf), _("Message from %s@%s on %s at %02d:%02d ..."),
 		       login, host, ctl->src_tty_name,
 		       tm->tm_hour, tm->tm_min);
 	free(host);
+	fputs_careful(buf, stdout, '^', true, 0);
 	printf("\r\n");
 
 	while (getline(&line, &linelen, stdin) >= 0) {

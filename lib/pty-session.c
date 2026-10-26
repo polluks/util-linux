@@ -186,9 +186,6 @@ int ul_pty_setup(struct ul_pty *pty)
 		if (rc)
 			goto done;
 
-		/* set the current terminal to raw mode; pty_cleanup() reverses this change on exit */
-		cfmakeraw(&attrs);
-		tcsetattr(STDIN_FILENO, TCSANOW, &attrs);
 	} else {
 		DBG_OBJ(SETUP, pty, ul_debug("create for non-terminal"));
 
@@ -215,6 +212,23 @@ done:
 	DBG_OBJ(SETUP, pty, ul_debug("pty setup done [master=%d, slave=%d, rc=%d]",
 				pty->master, pty->slave, rc));
 	return rc;
+}
+
+/* call me after ul_pty_signals_setup() and before fork() */
+int ul_pty_terminal_setup(struct ul_pty *pty)
+{
+	struct termios attrs;
+
+	if (!pty->isterm)
+		return 0;
+
+	attrs = pty->stdin_attrs;
+	cfmakeraw(&attrs);
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &attrs))
+		return -errno;
+
+	DBG_OBJ(SETUP, pty, ul_debug("terminal raw mode setup done"));
+	return 0;
 }
 
 /* call me before fork() */
@@ -312,7 +326,7 @@ static int write_output(char *obuf, ssize_t bytes)
 {
 	DBG(IO, ul_debug(" writing output"));
 
-	if (write_all(STDOUT_FILENO, obuf, bytes)) {
+	if (ul_write_all(STDOUT_FILENO, obuf, bytes)) {
 		DBG(IO, ul_debug("  writing output *failed*"));
 		return -errno;
 	}
@@ -582,6 +596,8 @@ static int handle_signal(struct ul_pty *pty, int fd)
 							&info, (void *) &pty->win);
 		}
 		break;
+	case SIGALRM:
+		FALLTHROUGH;
 	case SIGHUP:
 		FALLTHROUGH;
 	case SIGTERM:
@@ -589,7 +605,7 @@ static int handle_signal(struct ul_pty *pty, int fd)
 	case SIGINT:
 		FALLTHROUGH;
 	case SIGQUIT:
-		DBG_OBJ(SIG, pty, ul_debug(" get signal SIG{TERM,INT,QUIT}"));
+		DBG_OBJ(SIG, pty, ul_debug(" get signal SIG{ALRM,HUP,TERM,INT,QUIT}"));
 		pty->delivered_signal = info.ssi_signo;
 		/* Child termination is going to generate SIGCHLD (see above) */
 		if (pty->child > 0)
@@ -658,7 +674,7 @@ int ul_pty_proxy_master(struct ul_pty *pty)
 
 			gettime_monotonic(&now);
 			timersub(&pty->next_callback_time, &now, &rest);
-			timeout = (rest.tv_sec * 1000) +  (rest.tv_usec / 1000);
+			timeout = (rest.tv_sec * MSEC_PER_SEC) +  (rest.tv_usec / USEC_PER_MSEC);
 		} else
 			timeout = pty->poll_timeout;
 
@@ -804,6 +820,8 @@ int main(int argc, char *argv[])
 		err(EXIT_FAILURE, "failed to create pseudo-terminal");
 	if (ul_pty_signals_setup(pty))
 		err(EXIT_FAILURE, "failed to initialize signals handler");
+	if (ul_pty_terminal_setup(pty))
+		err(EXIT_FAILURE, "failed to setup terminal");
 
 	fflush(stdout);			/* ??? */
 

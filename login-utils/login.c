@@ -129,6 +129,7 @@ struct login_context {
 #ifdef LOGIN_CHOWN_VCS
 	char		vcsn[VCS_PATH_MAX];	/* virtual console name */
 	char		vcsan[VCS_PATH_MAX];
+	char		vcsun[VCS_PATH_MAX];
 #endif
 
 	char		*thishost;		/* this machine */
@@ -400,7 +401,7 @@ static void motd(void)
 			done += motddir(file);
 #endif
 		if (S_ISREG(st.st_mode) && st.st_size > 0) {
-			int fd = open(file, O_RDONLY, 0);
+			int fd = open(file, O_RDONLY | O_CLOEXEC, 0);
 			if (fd >= 0) {
 				ul_copy_file(fd, fileno(stdout));
 				close(fd);
@@ -457,7 +458,7 @@ static void open_tty(const char *tty)
 {
 	int i, fd, flags;
 
-	fd = open(tty, O_RDWR | O_NONBLOCK);
+	fd = open(tty, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd == -1) {
 		syslog(LOG_ERR, _("FATAL: can't reopen tty: %m"));
 		sleepexit(EXIT_FAILURE);
@@ -511,15 +512,20 @@ static void chown_tty(struct login_context *cxt)
 
 #ifdef LOGIN_CHOWN_VCS
 	if (is_consoletty(0)) {
-		if (chown(cxt->vcsn, uid, gid))			/* vcs */
+		if (chown(cxt->vcsn, uid, gid) && errno != ENOENT)	/* vcs */
 			chown_err(cxt->vcsn, uid, gid);
-		if (chmod(cxt->vcsn, cxt->tty_mode))
+		if (chmod(cxt->vcsn, cxt->tty_mode) && errno != ENOENT)
 			chmod_err(cxt->vcsn, cxt->tty_mode);
 
-		if (chown(cxt->vcsan, uid, gid))		/* vcsa */
+		if (chown(cxt->vcsan, uid, gid) && errno != ENOENT)	/* vcsa */
 			chown_err(cxt->vcsan, uid, gid);
-		if (chmod(cxt->vcsan, cxt->tty_mode))
+		if (chmod(cxt->vcsan, cxt->tty_mode) && errno != ENOENT)
 			chmod_err(cxt->vcsan, cxt->tty_mode);
+
+		if (chown(cxt->vcsun, uid, gid) && errno != ENOENT)	/* vcsu */
+			chown_err(cxt->vcsun, uid, gid);
+		if (chmod(cxt->vcsun, cxt->tty_mode) && errno != ENOENT)
+			chmod_err(cxt->vcsun, cxt->tty_mode);
 	}
 #endif
 }
@@ -561,6 +567,7 @@ static void init_tty(struct login_context *cxt)
 		/* find names of Virtual Console devices, for later mode change */
 		snprintf(cxt->vcsn, sizeof(cxt->vcsn), "/dev/vcs%s", cxt->tty_number);
 		snprintf(cxt->vcsan, sizeof(cxt->vcsan), "/dev/vcsa%s", cxt->tty_number);
+		snprintf(cxt->vcsun, sizeof(cxt->vcsun), "/dev/vcsu%s", cxt->tty_number);
 	}
 #endif
 
@@ -702,7 +709,7 @@ static void log_lastlog(struct login_context *cxt)
 	sa.sa_handler = SIG_IGN;
 	sigaction(SIGXFSZ, &sa, &oldsa_xfsz);
 
-	fd = open(_PATH_LASTLOG, O_RDWR, 0);
+	fd = open(_PATH_LASTLOG, O_RDWR | O_CLOEXEC, 0);
 	if (fd < 0)
 		goto done;
 	offset = cxt->pwd->pw_uid * sizeof(ll);
@@ -1528,20 +1535,20 @@ static void login_shell_fallback(char **child_argv)
 	if (!key_file)
 		return;
 
-	error = econf_getKeys(key_file, NULL, &size, &keys);
+	error = econf_call(econf_getKeys)(key_file, NULL, &size, &keys);
 	if (error) {
-		econf_free(key_file);
+		econf_call(econf_freeFile)(key_file);
 		errx(EXIT_FAILURE,
 			_("Cannot evaluate entries in shells files: %s"),
-			econf_errString(error));
+			econf_call(econf_errString)(error));
 	}
 
 	for (size_t i = 0; i < size; i++) {
 		build_shell_argv(keys[i], child_argv);
 		execvp(child_argv[0], child_argv + 1);
 	}
-	econf_free(keys);
-	econf_free(key_file);
+	econf_call(econf_freeArray)(keys);
+	econf_call(econf_freeFile)(key_file);
 #else
 	char *s;
 	setusershell();

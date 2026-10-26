@@ -235,7 +235,7 @@ static int sun_create_disklabel(struct fdisk_context *cxt)
 	if (cxt->geom.heads && cxt->geom.sectors) {
 		fdisk_sector_t llsectors;
 
-		if (blkdev_get_sectors(cxt->dev_fd, (unsigned long long *) &llsectors) == 0) {
+		if (blkdev_get_sectors(cxt->dev_fd, &llsectors) == 0) {
 			int sec_fac = cxt->sector_size / 512;
 			fdisk_sector_t llcyls;
 
@@ -741,6 +741,9 @@ static int sun_delete_partition(struct fdisk_context *cxt,
 	assert(cxt->label);
 	assert(fdisk_is_label(cxt, SUN));
 
+	if (partnum >= cxt->label->nparts_max)
+		return -EINVAL;
+
 	sunlabel = self_disklabel(cxt);
 	part = &sunlabel->partitions[partnum];
 	info = &sunlabel->vtoc.infos[partnum];
@@ -1024,9 +1027,9 @@ static int sun_write_disklabel(struct fdisk_context *cxt)
 	sunlabel->csum = 0;
 	sunlabel->csum = sun_pt_checksum(sunlabel);
 
-	if (lseek(cxt->dev_fd, 0, SEEK_SET) < 0)
+	if (ul_vfs_lseek(cxt->vfs, cxt->dev_fd, 0, SEEK_SET) < 0)
 		return -errno;
-	if (write_all(cxt->dev_fd, sunlabel, sz) != 0)
+	if (ul_vfs_write_all(cxt->vfs, cxt->dev_fd, sunlabel, sz) != 0)
 		return -errno;
 
 	return 0;

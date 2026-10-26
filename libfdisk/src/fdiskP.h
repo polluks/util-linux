@@ -21,6 +21,7 @@
 
 #include "c.h"
 #include "libfdisk.h"
+#include "vfs.h"
 
 #include "list.h"
 #include "debug.h"
@@ -438,6 +439,8 @@ struct fdisk_context {
 
 	struct fdisk_context	*parent;	/* for nested PT */
 	struct fdisk_script	*script;	/* what we want to follow */
+
+	struct ul_vfs_ops	*vfs;		/* pluggable I/O ops (owned, or NULL) */
 };
 
 /* table */
@@ -535,5 +538,9 @@ int fdisk_check_collisions(struct fdisk_context *cxt);
 
 /* parttype.c */
 const char *fdisk_label_translate_type_shortcut(const struct fdisk_label *lb, char *cut);
+
+/* script.c */
+int fdisk_script_get_u64(struct fdisk_context *cxt,
+			 const char *name, uint64_t *num);
 
 #endif /* _LIBFDISK_PRIVATE_H */

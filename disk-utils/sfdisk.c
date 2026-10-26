@@ -51,6 +51,7 @@
 #include "rpmatch.h"
 #include "optutils.h"
 #include "ttyutils.h"
+#include "timeutils.h"
 
 #include "libfdisk.h"
 #include "fdisk-list.h"
@@ -106,6 +107,7 @@ struct sfdisk {
 
 	struct fdisk_context	*cxt;		/* libfdisk context */
 	struct fdisk_partition  *orig_pa;	/* -N <partno> before the change */
+	struct fdisk_table	*orig_layout;	/* original layout for -N and --append */
 
 	unsigned int verify : 1,	/* call fdisk_verify_disklabel() */
 		     quiet  : 1,	/* suppress extra messages */
@@ -305,12 +307,12 @@ static void backup_sectors(struct sfdisk *sf,
 	} else {
 		unsigned char *buf = xmalloc(size);
 
-		if (read_all(devfd, (char *) buf, size) != (ssize_t) size) {
+		if (ul_read_all(devfd, (char *) buf, size) != (ssize_t) size) {
 			fdisk_warn(sf->cxt, _("cannot read %s"), devname);
 			free(buf);
 			goto fail;
 		}
-		if (write_all(fd, buf, size) != 0) {
+		if (ul_write_all(fd, buf, size) != 0) {
 			fdisk_warn(sf->cxt, _("cannot write %s"), fname);
 			free(buf);
 			goto fail;
@@ -492,6 +494,7 @@ static int move_partition_data(struct sfdisk *sf, size_t partno, struct fdisk_pa
 		if (!yes) {
 			fdisk_info(sf->cxt, _("Leaving."));
 			free(devname);
+			free(typescript);
 			return 0;
 		}
 	}
@@ -548,7 +551,7 @@ static int move_partition_data(struct sfdisk *sf, size_t partno, struct fdisk_pa
 		if (!sf->noact) {
 			/* read source */
 			if (lseek(fd, src, SEEK_SET) == (off_t) -1 ||
-			    read_all(fd, buf, step_bytes) != (ssize_t) step_bytes) {
+			    ul_read_all(fd, buf, step_bytes) != (ssize_t) step_bytes) {
 				if (f)
 					fprintf(f, "%05zu: read error %12ju %12ju\n", cc, src, dst);
 				fdisk_warn(sf->cxt,
@@ -559,7 +562,7 @@ static int move_partition_data(struct sfdisk *sf, size_t partno, struct fdisk_pa
 
 			/* write target */
 			if (lseek(fd, dst, SEEK_SET) == (off_t) -1 ||
-			    write_all(fd, buf, step_bytes) != 0) {
+			    ul_write_all(fd, buf, step_bytes) != 0) {
 				if (f)
 					fprintf(f, "%05zu: write error %12ju %12ju\n", cc, src, dst);
 				fdisk_warn(sf->cxt,
@@ -577,16 +580,16 @@ static int move_partition_data(struct sfdisk *sf, size_t partno, struct fdisk_pa
 			fprintf(f, "%05zu: %12ju %12ju\n", cc, src, dst);
 
 		if (progress && i % 10 == 0) {
-			unsigned int elapsed = 0;	/* usec */
+			usec_t elapsed = 0;
 			struct timeval cur_time;
 
 			gettimeofday(&cur_time, NULL);
 			if (cur_time.tv_sec - prev_time.tv_sec > 1) {
-				elapsed = ((cur_time.tv_sec - prev_time.tv_sec) * 1000000) +
+				elapsed = ((cur_time.tv_sec - prev_time.tv_sec) * USEC_PER_SEC) +
 					  (cur_time.tv_usec - prev_time.tv_usec);
 
 				bytes_per_sec = ((i - prev) * ss) / elapsed;	/* per usec */
-				bytes_per_sec *= 1000000;			/* per sec */
+				bytes_per_sec *= USEC_PER_SEC;			/* per sec */
 
 				prev_time = cur_time;
 				prev = i;
@@ -668,7 +671,10 @@ static int write_changes(struct sfdisk *sf)
 			 * related to the write to the device.
 			 */
 			xusleep(250000);
-			fdisk_reread_partition_table(sf->cxt);
+			if (sf->orig_layout)
+				fdisk_reread_changes(sf->cxt, sf->orig_layout);
+			else
+				fdisk_reread_partition_table(sf->cxt);
 		}
 	}
 
@@ -808,6 +814,7 @@ static int command_verify(struct sfdisk *sf, int argc, char **argv)
 static int get_size(const char *dev, int silent, uintmax_t *sz)
 {
 	int fd, rc = 0;
+	uint64_t nsectors = 0;
 
 	fd = open(dev, O_RDONLY);
 	if (fd < 0) {
@@ -816,11 +823,12 @@ static int get_size(const char *dev, int silent, uintmax_t *sz)
 		return -errno;
 	}
 
-	if (blkdev_get_sectors(fd, (unsigned long long *) sz) == -1) {
+	if (blkdev_get_sectors(fd, &nsectors) == -1) {
 		if (!silent)
 			warn(_("Cannot get size of %s"), dev);
 		rc = -errno;
-	}
+	} else
+		*sz = nsectors;
 
 	close(fd);
 	return rc;
@@ -1139,6 +1147,8 @@ static void assign_device_partition(struct sfdisk *sf,
 	if (partno > n)
 		errx(EXIT_FAILURE, _("%s: partition %zu: partition table contains "
 				     "only %zu partitions"), devname, partno, n);
+	if (partno == 0)
+		errx(EXIT_FAILURE, _("%s: partition number must be a positive number"), devname);
 	if (!fdisk_is_partition_used(sf->cxt, partno - 1))
 		errx(EXIT_FAILURE, _("%s: partition %zu: partition is unused"),
 				devname, partno);
@@ -1523,6 +1533,7 @@ static void sfdisk_print_partition(struct sfdisk *sf, size_t n)
 {
 	struct fdisk_partition *pa = NULL;
 	char *data;
+	int rc;
 
 	assert(sf);
 
@@ -1531,20 +1542,35 @@ static void sfdisk_print_partition(struct sfdisk *sf, size_t n)
 	if (fdisk_get_partition(sf->cxt, n, &pa) != 0)
 		return;
 
-	fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_DEVICE, &data);
-	printf("%12s : ", data);
+	rc = fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_DEVICE, &data);
+	if (rc == 0) {
+		printf("%12s : ", data);
+		free(data);
+	}
 
-	fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_START, &data);
-	printf("%12s ", data);
+	rc = fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_START, &data);
+	if (rc == 0) {
+		printf("%12s ", data);
+		free(data);
+	}
 
-	fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_END, &data);
-	printf("%12s ", data);
+	rc = fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_END, &data);
+	if (rc == 0) {
+		printf("%12s ", data);
+		free(data);
+	}
 
-	fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_SIZE, &data);
-	printf("(%s) ", data);
+	rc = fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_SIZE, &data);
+	if (rc == 0) {
+		printf("(%s) ", data);
+		free(data);
+	}
 
-	fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_TYPE, &data);
-	printf("%s\n", data);
+	rc = fdisk_partition_to_string(pa, sf->cxt, FDISK_FIELD_TYPE, &data);
+	if (rc == 0) {
+		printf("%s\n", data);
+		free(data);
+	}
 
 	fdisk_unref_partition(pa);
 }
@@ -1847,6 +1873,8 @@ static int command_fdisk(struct sfdisk *sf, int argc, char **argv)
 		errx(EXIT_FAILURE, _("no disk device specified"));
 
 	assign_device(sf, devname, 0);
+	if ((partno >= 0 || sf->append) && fdisk_device_is_used(sf->cxt))
+		fdisk_get_partitions(sf->cxt, &sf->orig_layout);
 
 	dp = fdisk_new_script(sf->cxt);
 	if (!dp)
@@ -1934,6 +1962,8 @@ static int command_fdisk(struct sfdisk *sf, int argc, char **argv)
 		label = sf->label;
 	else if (fdisk_has_label(sf->cxt))
 		label = fdisk_label_get_name(fdisk_get_label(sf->cxt, NULL));
+	else if (sf->interactive)
+		label = fdisk_get_recommended_labelname();
 	else
 		label = "dos";	/* just for backward compatibility */
 
@@ -2126,6 +2156,8 @@ static int command_fdisk(struct sfdisk *sf, int argc, char **argv)
 
 	fdisk_set_script(sf->cxt, NULL);
 	fdisk_unref_script(dp);
+	fdisk_unref_table(sf->orig_layout);
+	sf->orig_layout = NULL;
 	return rc;
 }
 

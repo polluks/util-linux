@@ -314,7 +314,8 @@ static int is_tabdiff_column(int id)
  */
 int is_listall_mode(unsigned int flags)
 {
-	if ((flags & FL_DF || flags & FL_REAL || flags & FL_PSEUDO) && !(flags & FL_ALL))
+	if ((flags & (FL_DF | FL_REAL | FL_PSEUDO | FL_NET | FL_LOCAL))
+	    && !(flags & FL_ALL))
 		return 0;
 
 	return (!is_defined_match(COL_SOURCE) &&
@@ -1108,6 +1109,7 @@ static struct libmnt_table *fetch_listmount(struct findmnt *findmnt)
 	mnt_table_set_userdata(tb, findmnt);
 
 	mnt_table_refer_statmnt(tb, sm);
+	mnt_table_disable_useropts(tb, 1);
 
 	if (mnt_table_fetch_listmount(tb) != 0) {
 		warn(_("failed to fetch mount nodes"));
@@ -1237,6 +1239,12 @@ static int match_func(struct libmnt_fs *fs,
 	    return rc;
 
 	if ((findmnt->flags & FL_PSEUDO) && !mnt_fs_is_pseudofs(fs))
+	    return rc;
+
+	if ((findmnt->flags & FL_NET) && !mnt_fs_is_netfs(fs))
+	    return rc;
+
+	if ((findmnt->flags & FL_LOCAL) && mnt_fs_is_netfs(fs))
 	    return rc;
 
 	if ((findmnt->flags & FL_SHADOWED)) {
@@ -1555,6 +1563,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -i, --invert           invert the sense of matching\n"), out);
 	fputs(_("     --id <num>         filter by mount node ID\n"), out);
 	fputs(_("     --uniq-id <num>    filter by mount node 64-bit ID (requires --kernel=listmount)\n"), out);
+	fputs(_("     --local            print only local (non-network) filesystems\n"), out);
+	fputs(_("     --net              print only network filesystems\n"), out);
 	fputs(_("     --pseudo           print only pseudo-filesystems\n"), out);
 	fputs(_(" -Q, --filter <expr>    apply display filter\n"), out);
 	fputs(_(" -M, --mountpoint <dir> the mountpoint directory\n"), out);
@@ -1653,6 +1663,12 @@ static struct libscols_table *init_scols_table(struct findmnt *findmnt)
 
 	if (flags & FL_JSON)
 		scols_table_set_name(table, "filesystems");
+
+	/* The poll mode prints a continuous stream of the events, print every
+	 * event as a stand-alone JSON object rather than as a pretty printed
+	 * object on more lines. */
+	if ((flags & FL_JSON) && (flags & FL_POLL))
+		scols_table_set_json_format(table, "lines");
 
 	for (size_t i = 0; i < ncolumns; i++) {
 		struct libscols_column *cl;
@@ -1761,8 +1777,9 @@ int main(int argc, char *argv[])
 	int c, rc = -1, timeout = -1;
 	int ntabfiles = 0, tabtype = 0;
 	char *outarg = NULL;
-	size_t i;
+	size_t i, nfilters = 0;
 	int force_tree = 0, istree = 0;
+	int force_target = 0;
 
 	struct libscols_table *table = NULL;
 
@@ -1772,6 +1789,8 @@ int main(int argc, char *argv[])
 		FINDMNT_OPT_OUTPUT_ALL,
 		FINDMNT_OPT_PSEUDO,
 		FINDMNT_OPT_REAL,
+		FINDMNT_OPT_NET,
+		FINDMNT_OPT_LOCAL,
 		FINDMNT_OPT_VFS_ALL,
 		FINDMNT_OPT_SHADOWED,
 		FINDMNT_OPT_HYPERLINK,
@@ -1824,6 +1843,8 @@ int main(int argc, char *argv[])
 		{ "tree",	    no_argument,       NULL, FINDMNT_OPT_TREE	 },
 		{ "real",	    no_argument,       NULL, FINDMNT_OPT_REAL	 },
 		{ "pseudo",	    no_argument,       NULL, FINDMNT_OPT_PSEUDO	 },
+		{ "net",	    no_argument,       NULL, FINDMNT_OPT_NET	 },
+		{ "local",	    no_argument,       NULL, FINDMNT_OPT_LOCAL	 },
 		{ "vfs-all",	    no_argument,       NULL, FINDMNT_OPT_VFS_ALL },
 		{ "shadowed",       no_argument,       NULL, FINDMNT_OPT_SHADOWED },
 		{ "hyperlink",      optional_argument, NULL, FINDMNT_OPT_HYPERLINK },
@@ -1844,6 +1865,7 @@ int main(int argc, char *argv[])
 		{ 'p','x' },			/* poll,verify */
 		{ 'm','p','s' },		/* mtab,poll,fstab */
 		{ FINDMNT_OPT_PSEUDO, FINDMNT_OPT_REAL },
+		{ FINDMNT_OPT_NET, FINDMNT_OPT_LOCAL },
 		{ 0 }
 	};
 	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
@@ -1926,6 +1948,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'O':
 			set_match(COL_OPTIONS, optarg);
+			nfilters++;
 			break;
 		case 'p':
 			if (optarg) {
@@ -1944,6 +1967,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'Q':
 			findmnt.filter = new_filter(optarg);
+			nfilters++;
 			break;
 		case 'm':		/* mtab */
 			tabtype = TABTYPE_MTAB;
@@ -1969,6 +1993,7 @@ int main(int argc, char *argv[])
 			break;
 		case 't':
 			set_match(COL_FSTYPE, optarg);
+			nfilters++;
 			break;
 		case 'r':
 			findmnt.flags &= ~FL_TREE;	/* disable the default */
@@ -1995,13 +2020,15 @@ int main(int argc, char *argv[])
 		case 'S':
 			set_source_match(optarg, &findmnt);
 			findmnt.flags |= FL_NOSWAPMATCH;
+			nfilters++;
 			break;
 		case 'M':
 			findmnt.flags |= FL_STRICTTARGET;
 			FALLTHROUGH;
 		case 'T':
 			set_match(COL_TARGET, optarg);
-			findmnt.flags |= FL_NOSWAPMATCH;
+			nfilters++;
+			force_target = 1;
 			break;
 		case 'U':
 			findmnt.flags |= FL_UNIQ;
@@ -2023,15 +2050,26 @@ int main(int argc, char *argv[])
 			break;
 		case FINDMNT_OPT_PSEUDO:
 			findmnt.flags |= FL_PSEUDO;
+			nfilters++;
 			break;
 		case FINDMNT_OPT_REAL:
 			findmnt.flags |= FL_REAL;
+			nfilters++;
+			break;
+		case FINDMNT_OPT_NET:
+			findmnt.flags |= FL_NET;
+			nfilters++;
+			break;
+		case FINDMNT_OPT_LOCAL:
+			findmnt.flags |= FL_LOCAL;
+			nfilters++;
 			break;
 		case FINDMNT_OPT_VFS_ALL:
 			findmnt.flags |= FL_VFS_ALL;
 			break;
 		case FINDMNT_OPT_SHADOWED:
 			findmnt.flags |= FL_SHADOWED;
+			nfilters++;
 			break;
 		case FINDMNT_OPT_HYPERLINK:
 			if (hyperlinkwanted(optarg))
@@ -2043,6 +2081,7 @@ int main(int argc, char *argv[])
 
 				*id = strtos32_or_err(optarg, _("invalid id argument"));
 				set_match_data(COL_ID, (void *) id);
+				nfilters++;
 				break;
 			}
 		case FINDMNT_OPT_UNIQ_ID:
@@ -2051,6 +2090,7 @@ int main(int argc, char *argv[])
 
 				*id = strtou64_or_err(optarg, _("invalid uniq-id argument"));
 				set_match_data(COL_UNIQ_ID, (void *) id);
+				nfilters++;
 				break;
 			}
 		case 'H':
@@ -2115,10 +2155,14 @@ int main(int argc, char *argv[])
 			"options --target and --source can't be used together "
 			"with command line element that is not an option"));
 
-	if (optind < argc)
+	if (optind < argc) {
 		set_source_match(argv[optind++], &findmnt);	/* dev/tag/mountpoint/maj:min */
-	if (optind < argc)
+		nfilters++;
+	}
+	if (optind < argc) {
 		set_match(COL_TARGET, argv[optind++]);	/* mountpoint */
+		nfilters++;
+	}
 
 	if ((findmnt.flags & FL_SUBMOUNTS) && is_listall_mode(findmnt.flags))
 		/* don't care about submounts if list all mounts */
@@ -2141,6 +2185,11 @@ int main(int argc, char *argv[])
 		if (!strncmp(x, "LABEL=", 6) || !strncmp(x, "UUID=", 5) ||
 		    !strncmp(x, "PARTLABEL=", 10) || !strncmp(x, "PARTUUID=", 9))
 			findmnt.flags |= FL_NOSWAPMATCH;
+	}
+
+	if (force_target) {
+		direction = MNT_ITER_BACKWARD;
+		findmnt.flags |= FL_NOSWAPMATCH | FL_FIRSTONLY;
 	}
 
 	/*
@@ -2228,8 +2277,14 @@ int main(int argc, char *argv[])
 	/*
 	 * Print the output table for non-poll modes
 	 */
-	if (!rc && !(findmnt.flags & FL_POLL))
+	if (!rc && !(findmnt.flags & FL_POLL)) {
+		/* Note that the table is printed also when empty to keep the
+		 * output valid (for example JSON) for the parsers. */
 		scols_print_table(table);
+
+		if (!scols_table_get_nlines(table) && nfilters)
+			rc = 1;	/* filters defined, found nothing */
+	}
 leave:
 	scols_unref_table(table);
 	scols_unref_filter(findmnt.filter);

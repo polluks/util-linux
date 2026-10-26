@@ -1,6 +1,9 @@
 /*
  * test_mkfds - make various file descriptors
  *
+ * For architecture overview, test writing guide, and instructions on
+ * how to add new factories, see Documentation/HOWTO-HACKING-lsfd.md.
+ *
  * Written by Masatake YAMATO <yamato@redhat.com>
  *
  * This program is free software; you can redistribute it and/or
@@ -16,21 +19,17 @@
  * along with this program.  If not, see <https://gnu.org/licenses/>.
  */
 
-#include "c.h"
-#include "cctype.h"
-#include "xalloc.h"
-#include "test_mkfds.h"
-#include "exitcodes.h"
-#include "pidfd-utils.h"
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <getopt.h>
 #include <linux/bpf.h>
+#include <sys/mount.h>
+#ifdef HAVE_LINUX_IO_URING_H
+#include <linux/io_uring.h>
+#endif
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/if_tun.h>
@@ -55,6 +54,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -73,7 +73,14 @@
 #include <time.h>
 #include <unistd.h>
 
-#define _U_ __attribute__((__unused__))
+#include "c.h"
+#include "cctype.h"
+#include "exitcodes.h"
+#include "libsmartcols.h"
+#include "optutils.h"
+#include "pidfd-utils.h"
+#include "test_mkfds.h"
+#include "xalloc.h"
 
 static void do_nothing(int signum _U_);
 
@@ -91,6 +98,7 @@ static void __attribute__((__noreturn__)) usage(FILE *out, int status)
 	fputs(" -q, --quiet                   don't print pid(s)\n", out);
 	fputs(" -X, --dont-monitor-stdin      don't monitor stdin when pausing\n", out);
 	fputs(" -c, --dont-pause              don't pause after making fd(s)\n", out);
+	fputs(" -t, --timeout <sec>           timeout in seconds\n", out);
 	fputs(" -w, --wait-with <multiplexer> use MULTIPLEXER for waiting events\n", out);
 	fputs(" -W, --multiplexers            list multiplexers\n", out);
 
@@ -315,6 +323,10 @@ static struct arg decode_arg(const char *pname,
 	return arg;
 }
 
+/*
+ * Caller MUST call free_arg() for each struct arg returned by decode_arg()
+ * to prevent memory leaks (e.g. allocated string values).
+ */
 static void free_arg(struct arg *arg)
 {
 	arg->free(arg->v);
@@ -327,26 +339,75 @@ struct factory {
 #define MAX_N 13
 	int  N;			/* the number of fds this factory makes */
 	int  EX_N;		/* fds made optionally */
-	int  EX_O;		/* the number of extra words printed to stdout. */
-	void *(*make)(const struct factory *, struct fdesc[], int, char **);
-	void (*free)(const struct factory *, void *);
-	void (*report)(const struct factory *, int, void *, FILE *);
-	const struct parameter * params;
+	int  EX_O;		/* the number of extra words printed to stdout (must match o_descs length). */
+
+	/*
+	 * make() creates resources and assigns them to fdescs[0..N-1].fd via dup2().
+	 * It can return a custom context pointer, which will be passed to report() and free().
+	 */
+	void *(*make)(const struct factory *factory, struct fdesc fdescs[], int argc, char **argv);
+
+	/* free() releases the custom context pointer returned by make() */
+	void (*free)(const struct factory *factory, void *data);
+
+	/* report() prints the nth extra output value (0 <= nth < EX_O) to fp */
+	void (*report)(const struct factory *factory, int nth, void *data, FILE *fp);
+
+	const struct parameter * params;	/* must be terminated with PARAM_END */
 	const char **o_descs;	/* string array describing values printed
 				 * to stdout. Used in -O option.
 				 * EX_O elements are expected. */
 };
+
+/*
+ * Validate remaining arguments passed after the factory's positional
+ * file descriptor arguments (factory->N):
+ *
+ * 1. Each argument must be in "name=value" parameter format (must contain '=').
+ *    Positional arguments without '=' (such as extra fd numbers) are rejected
+ *    as "too many file descriptors".
+ * 2. The parameter name (before '=') must not be empty.
+ * 3. The parameter name must match one of the parameters defined in
+ *    factory->params.
+ */
+static void validate_factory_arguments(const struct factory *factory, int argc, char **argv)
+{
+	for (int i = 0; i < argc; i++) {
+		const char *arg = argv[i];
+		const char *eq = strchr(arg, '=');
+		bool found = false;
+
+		if (!eq)
+			errx(EXIT_FAILURE, "too many file descriptors given for %s: %s",
+			     factory->name, arg);
+
+		if (eq == arg)
+			errx(EXIT_FAILURE, "no parameter name given for %s: %s",
+			     factory->name, arg);
+
+		size_t name_len = eq - arg;
+		for (const struct parameter *p = factory->params; p && p->name; p++) {
+			if (strncmp(p->name, arg, name_len) == 0 && p->name[name_len] == '\0') {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+			errx(EXIT_FAILURE, "unknown parameter \"%.*s\" for %s",
+			     (int)name_len, arg, factory->name);
+	}
+}
 
 static void close_fdesc(int fd, void *data _U_)
 {
 	close(fd);
 }
 
-volatile ssize_t unused_result_ok;
 static void abort_with_child_death_message(int signum _U_)
 {
 	const char msg[] = "the child process exits unexpectedly";
-	unused_result_ok = write(2, msg, sizeof(msg));
+	ignore_result(write(2, msg, sizeof(msg)));
 	_exit(EXIT_FAILURE);
 }
 
@@ -735,6 +796,351 @@ static void free_after_closing_duplicated_fd(const struct factory * factory _U_,
 	}
 }
 
+struct munmap_data {
+	void *ptr;
+	size_t len;
+};
+
+static void close_fdesc_after_munmap(int fd, void *data)
+{
+	struct munmap_data *munmap_data = data;
+	if (munmap_data) {
+		munmap(munmap_data->ptr, munmap_data->len);
+		free(data);
+	}
+	close(fd);
+}
+
+#ifdef HAVE_LIBFUSE
+struct hungfs_ctl {
+	int fd;
+	pid_t pid;
+	char *mountpoint;
+	char *targetfile;
+	bool hung;
+	dev_t orig_dev;
+};
+
+static void stop_hungfs(struct hungfs_ctl *ctl)
+{
+	if (ctl->fd >= 0)
+		close(ctl->fd);
+	if (ctl->pid > 0) {
+		kill(ctl->pid, SIGTERM);
+		while (waitpid(ctl->pid, NULL, 0) < 0 && errno == EINTR)
+			;
+	}
+	/*
+	 * When the FUSE server process terminates, its FUSE mount is
+	 * automatically cleaned up by the kernel. If a pre-existing bind mount
+	 * exists on the same filesystem (sharing st_dev with its parent),
+	 * calling umount2 unconditionally here would mistakenly unmount that
+	 * underlying bind mount instead. Therefore, only unmount if the
+	 * mountpoint device still differs from the original pre-mount device.
+	 */
+	if (ctl->mountpoint) {
+		struct stat st;
+		if (stat(ctl->mountpoint, &st) == 0 && st.st_dev != ctl->orig_dev) {
+			if (umount2(ctl->mountpoint, MNT_DETACH) < 0
+			    && errno != EINVAL && errno != ENOENT)
+				warn("failed to unmount: %s", ctl->mountpoint);
+		}
+	}
+	free(ctl->mountpoint);
+	free(ctl->targetfile);
+}
+
+static void wait_hungfs(struct hungfs_ctl *ctl)
+{
+	int pfd;
+	struct pollfd pfds[2];
+	char c;
+
+	pfd = pidfd_open(ctl->pid, 0);
+	if (pfd < 0) {
+		int e = errno;
+		stop_hungfs(ctl);
+		errno = e;
+		err_nosys(EXIT_FAILURE, "failed to open pidfd for fuse server");
+	}
+
+	pfds[0] = (struct pollfd){ .fd = ctl->fd, .events = POLLIN };
+	pfds[1] = (struct pollfd){ .fd = pfd,     .events = POLLIN };
+
+	while (poll(pfds, 2, -1) < 0) {
+		if (errno == EINTR)
+			continue;
+		int e = errno;
+		close(pfd);
+		stop_hungfs(ctl);
+		errno = e;
+		err(EXIT_FAILURE, "failed in poll for fuse server");
+	}
+
+	close(pfd);
+
+	/* If fuse server terminated before sending READY, fail immediately */
+	if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+		int status;
+		pid_t r;
+		while ((r = waitpid(ctl->pid, &status, WNOHANG)) < 0 && errno == EINTR)
+			;
+		if (r > 0 && WIFEXITED(status)) {
+			ctl->pid = 0;
+			stop_hungfs(ctl);
+			errx(EXIT_FAILURE, "fuse server exited with status %d",
+			     WEXITSTATUS(status));
+		}
+		stop_hungfs(ctl);
+		errx(EXIT_FAILURE, "fuse server terminated unexpectedly");
+	}
+
+	/* Read READY signal from FUSE server's init callback */
+	ssize_t r;
+	while ((r = read(ctl->fd, &c, 1)) < 0 && errno == EINTR)
+		;
+	if (r != 1 || c != HUNGFS_READY) {
+		stop_hungfs(ctl);
+		errx(EXIT_FAILURE, "failed to receive READY from fuse server");
+	}
+}
+
+static void arm_hungfs(struct hungfs_ctl *ctl)
+{
+	char c = HUNGFS_HANG;
+	if (send(ctl->fd, &c, 1, MSG_NOSIGNAL) != 1) {
+		stop_hungfs(ctl);
+		errx(EXIT_FAILURE, "failed to send the 'hang' message to fuse server");
+	}
+}
+
+static void unarm_hungfs(struct hungfs_ctl *ctl)
+{
+	char c = HUNGFS_UNHUNG;
+	ignore_result(send(ctl->fd, &c, 1, MSG_NOSIGNAL));
+}
+
+static enum hungfs_target decode_hung_target(const char *target)
+{
+	if (strcmp(target, "file") == 0)
+		return HUNGFS_TARGET_FILE;
+	if (strcmp(target, "root") == 0)
+		return HUNGFS_TARGET_ROOT;
+	if (strcmp(target, "all") == 0)
+		return HUNGFS_TARGET_ALL;
+
+	errx(EXIT_FAILURE, "unknown hung-target value: %s", target);
+}
+
+static dev_t check_mountpoint(const char *mountpoint)
+{
+	struct stat sb, parent_sb;
+	char *parent;
+
+	if (strcmp(mountpoint, "/") == 0)
+		errx(EXIT_FAILURE, "refusing to use '/' as mountpoint");
+
+	if (lstat(mountpoint, &sb) < 0)
+		err(EXIT_FAILURE, "failed to access mountpoint: %s", mountpoint);
+	/*
+	 * Do not allow symbolic links for mountpoint to avoid any trouble
+	 * or pitfalls with path resolution (e.g. symlink pointing to '/').
+	 */
+	if (S_ISLNK(sb.st_mode))
+		errx(EXIT_FAILURE, "mountpoint must not be a symbolic link: %s", mountpoint);
+	if (!S_ISDIR(sb.st_mode))
+		errx(EXIT_FAILURE, "mountpoint is not a directory: %s", mountpoint);
+
+	xasprintf(&parent, "%s/..", mountpoint);
+	if (stat(parent, &parent_sb) == 0 && sb.st_dev != parent_sb.st_dev) {
+		free(parent);
+		errx(EXIT_FAILURE, "mountpoint is already a mountpoint: %s", mountpoint);
+	}
+	free(parent);
+
+	return sb.st_dev;
+}
+
+static void check_file_name(const char *file)
+{
+	if (!file || *file == '\0')
+		errx(EXIT_FAILURE, "file name must not be empty");
+	if (strchr(file, '/'))
+		errx(EXIT_FAILURE, "file name must not contain '/': %s", file);
+	if (strcmp(file, ".") == 0 || strcmp(file, "..") == 0)
+		errx(EXIT_FAILURE, "file name must not be '.' or '..': %s", file);
+}
+
+static void start_hungfs(struct hungfs_ctl *ctl,
+			 const char *mountpoint,
+			 const char *file,
+			 bool hung,
+			 enum hungfs_target hung_target)
+{
+	int sv[2];
+	pid_t pid;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0)
+		err(EXIT_FAILURE, "failed in socketpair for fuse IPC");
+
+	pid = fork();
+	if (pid < 0)
+		err(EXIT_FAILURE, "failed in fork");
+
+	if (pid == 0) {
+		close(sv[0]);
+		run_hungfs(&(struct hungfs_args) {
+				.ctlfd = sv[1],
+				.mountpoint = mountpoint,
+				.file = file,
+				.hung = hung,
+				.hung_target = hung_target
+			});
+		exit(EXIT_FAILURE);
+	}
+
+	close(sv[1]);
+	ctl->pid = pid;
+	ctl->fd = sv[0];
+	ctl->mountpoint = xstrdup(mountpoint);
+	ctl->hung = hung;
+	xasprintf(&ctl->targetfile, "%s/%s", mountpoint, file);
+
+	wait_hungfs(ctl);
+}
+
+static int open_hungfs_file(struct hungfs_ctl *ctl, struct munmap_data *mdata)
+{
+	int fd;
+
+	fd = open(ctl->targetfile, O_RDONLY);
+	if (fd < 0) {
+		int e = errno;
+		char *t = ctl->targetfile;
+
+		ctl->targetfile = NULL;
+		stop_hungfs(ctl);
+
+		free(mdata);
+		errno = e;
+		err(EXIT_FAILURE, "failed to open %s", t);
+	}
+
+	if (mdata) {
+		mdata->len = HUNGFS_FILE_SIZE;
+		mdata->ptr = mmap(NULL, mdata->len, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (mdata->ptr == MAP_FAILED) {
+			int e = errno;
+			char *t = ctl->targetfile;
+
+			ctl->targetfile = NULL;
+			stop_hungfs(ctl);
+
+			free(mdata);
+			errno = e;
+			err(EXIT_FAILURE, "failed in mmap %s", t);
+		}
+	}
+
+	return fd;
+}
+
+/*
+ * make_fuse_hungfs:
+ * Spawn a hungfs FUSE server child, wait for it to be ready, open (and
+ * optionally mmap) a file within the mountpoint, and optionally arm the
+ * hang on subsequent getattr requests.
+ *
+ * Cleanup notes:
+ * - When test_mkfds exits normally (via timeout, EOF on stdin, or regular
+ *   termination signals), the FUSE child is terminated and its mount is
+ *   cleaned up.
+ * - If the FUSE child is killed abruptly from outside with SIGKILL,
+ *   libfuse cannot run its normal unmount sequence and a dead FUSE mount
+ *   may remain, requiring manual 'umount' or 'umount -l' cleanup.
+ */
+static void *make_fuse_hungfs(const struct factory *factory, struct fdesc fdescs[],
+			      int argc, char **argv)
+{
+	int fd;
+	struct hungfs_ctl ctl = {
+		.pid = 0,
+		.fd = -1,
+		.mountpoint = NULL,
+		.targetfile = NULL,
+		.hung = false,
+		.orig_dev = 0,
+	};
+	struct arg mountpoint  = decode_arg("mountpoint", factory->params, argc, argv);
+	struct arg file        = decode_arg("file", factory->params, argc, argv);
+	struct arg hung        = decode_arg("hung", factory->params, argc, argv);
+	struct arg hung_target = decode_arg("hung-target", factory->params, argc, argv);
+	struct arg mmap_arg    = decode_arg("mmap", factory->params, argc, argv);
+
+	const char *sMountpoint        = ARG_STRING(mountpoint);
+	const char *sFile              = ARG_STRING(file);
+	bool bHung                     = ARG_BOOLEAN(hung);
+	enum hungfs_target eHungTarget = decode_hung_target(ARG_STRING(hung_target));
+	bool bMmap                     = ARG_BOOLEAN(mmap_arg);
+
+	struct munmap_data *mdata = NULL;
+
+	ctl.orig_dev = check_mountpoint(sMountpoint);
+	check_file_name(sFile);
+
+	/* Reserve the requested fd so socketpair won't occupy it */
+	reserve_fd(fdescs[0].fd);
+
+	start_hungfs(&ctl, sMountpoint, sFile, bHung, eHungTarget);
+
+	free_arg(&mountpoint);
+	free_arg(&file);
+	free_arg(&hung);
+	free_arg(&hung_target);
+	free_arg(&mmap_arg);
+
+	if (bMmap)
+		mdata = xmalloc(sizeof(*mdata));
+	fd = open_hungfs_file(&ctl, mdata);
+
+	if (ctl.hung)
+		arm_hungfs(&ctl);
+
+	/* Release the reservation and duplicate the opened fd into fdescs[0].fd */
+	if (fd != fdescs[0].fd) {
+		if (dup2(fd, fdescs[0].fd) < 0) {
+			int e = errno;
+			close(fd);
+			stop_hungfs(&ctl);
+
+			free(mdata);
+			errno = e;
+			err(EXIT_FAILURE, "failed to dup %d -> %d", fd, fdescs[0].fd);
+		}
+		close(fd);
+	}
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc_after_munmap,
+		.data  = mdata
+	};
+
+	return xmemdup(&ctl, sizeof(ctl));
+}
+
+static void free_fuse_hungfs(const struct factory *factory _U_, void *data)
+{
+	struct hungfs_ctl *ctl = data;
+
+	if (ctl->hung)
+		unarm_hungfs(ctl);
+
+	stop_hungfs(ctl);
+	free(ctl);
+}
+#endif /* HAVE_LIBFUSE */
+
 static void *make_pipe(const struct factory *factory, struct fdesc fdescs[],
 		       int argc, char ** argv)
 {
@@ -1030,19 +1436,6 @@ static int make_packet_socket(int socktype, const char *interface, int protocol)
 	return sd;
 }
 
-struct munmap_data {
-	void *ptr;
-	size_t len;
-};
-
-static void close_fdesc_after_munmap(int fd, void *data)
-{
-	struct munmap_data *munmap_data = data;
-	munmap(munmap_data->ptr, munmap_data->len);
-	free(data);
-	close(fd);
-}
-
 static void *make_mmapped_packet_socket(const struct factory *factory, struct fdesc fdescs[],
 					int argc, char ** argv)
 {
@@ -1176,6 +1569,116 @@ static void *make_inotify_fd(const struct factory *factory _U_, struct fdesc fde
 	return NULL;
 }
 
+struct inotify_multiple_inodes_data {
+	char *tempdir;
+	int count;
+};
+
+static void delete_generated_files(const char *tempdir, int count)
+{
+	for (int i = count; i > 0; i--) {
+		char buf[BUFSIZ];
+
+		snprintf(buf, sizeof(buf), "%s/%d", tempdir, i - 1);
+		unlink(buf);
+	}
+}
+
+static void create_files_exclusively(struct inotify_multiple_inodes_data *data)
+{
+	for (int i = 0; i < data->count; i++) {
+		char buf[BUFSIZ];
+		int fd;
+
+		snprintf(buf, sizeof(buf), "%s/%d", data->tempdir, i);
+		fd = open(buf, O_CREAT | O_EXCL, 0600);
+		if (fd < 0) {
+			int e = errno;
+			if (i > 0)
+				delete_generated_files(data->tempdir, i);
+			free(data->tempdir);
+
+			errno = e;
+			err(EXIT_FAILURE, "failed to create %s", buf);
+		}
+		close(fd);
+	}
+}
+
+static void watch_generated_files(int inotify_fd,
+				  struct inotify_multiple_inodes_data *data)
+{
+	for (int i = 0; i < data->count; i++) {
+		char buf[BUFSIZ];
+
+		snprintf(buf, sizeof(buf), "%s/%d", data->tempdir, i);
+		if (inotify_add_watch(inotify_fd, buf, IN_DELETE) < 0) {
+			delete_generated_files(data->tempdir, data->count);
+			free(data->tempdir);
+			err(EXIT_FAILURE, "failed in inotify_add_watch(\"%s\")", buf);
+		}
+	}
+}
+
+static void close_inotify_with_multiple_inodes(int fd, void *user_data)
+{
+	struct inotify_multiple_inodes_data *data = user_data;
+
+	delete_generated_files(data->tempdir, data->count);
+	free(data->tempdir);
+	close(fd);
+}
+
+static void *make_inotify_fd_monitoring_multiple_inodes(const struct factory *factory _U_, struct fdesc fdescs[],
+							int argc _U_, char ** argv _U_)
+{
+	struct arg tempdir = decode_arg("tempdir", factory->params, argc, argv);
+	const char *stempdir = ARG_STRING(tempdir);
+	struct arg count = decode_arg("count", factory->params, argc, argv);
+	const int icount = ARG_INTEGER(count);
+	static struct inotify_multiple_inodes_data data;
+	int fd;
+
+	if (icount < 0)
+		err(EXIT_FAILURE, "give a positive number as \"extra-files\": %d",
+		    icount);
+
+	if (stempdir == NULL || stempdir[0] == '\0')
+		err(EXIT_FAILURE, "no \"tempdir\" given");
+
+	data.tempdir = xstrdup(stempdir);
+	data.count = icount;
+	free_arg(&count);
+	free_arg(&tempdir);
+
+	create_files_exclusively(&data);
+	fd = inotify_init();
+	if (fd < 0) {
+		int e = errno;
+		delete_generated_files(data.tempdir, data.count);
+		free(data.tempdir);
+		errno = e;
+		err(EXIT_FAILURE, "failed in inotify_init()");
+	}
+
+	watch_generated_files(fd, &data);
+
+	if (fd != fdescs[0].fd) {
+		if (dup2(fd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", fd, fdescs[0].fd);
+		}
+		close(fd);
+	}
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_inotify_with_multiple_inodes,
+		.data  = &data,
+	};
+
+	return NULL;
+}
+
 static void close_unix_socket(int fd, void *data)
 {
 	char *path = data;
@@ -1186,6 +1689,22 @@ static void close_unix_socket(int fd, void *data)
 	}
 }
 
+static void init_unix_addr(struct sockaddr_un *un, size_t *un_len,
+			   const char *path, bool abstract)
+{
+	memset(un, 0, sizeof(*un));
+	un->sun_family = AF_UNIX;
+	*un_len = sizeof(*un);
+
+	if (abstract) {
+		size_t pathlen = strlen(path);
+		strncpy(un->sun_path + 1, path, sizeof(un->sun_path) - 1 - 1);
+		if (sizeof(un->sun_path) - 1 > pathlen)
+			*un_len = sizeof(*un) - sizeof(un->sun_path) + 1 + pathlen;
+	} else
+		strncpy(un->sun_path, path, sizeof(un->sun_path) - 1);
+}
+
 static void *make_unix_stream_core(const struct factory *factory, struct fdesc fdescs[],
 				   int argc, char ** argv, int type, const char *typestr)
 {
@@ -1193,7 +1712,7 @@ static void *make_unix_stream_core(const struct factory *factory, struct fdesc f
 	const char *spath = ARG_STRING(path);
 
 	struct arg backlog = decode_arg("backlog", factory->params, argc, argv);
-	int ibacklog = ARG_INTEGER(path);
+	int ibacklog = ARG_INTEGER(backlog);
 
 	struct arg abstract = decode_arg("abstract", factory->params, argc, argv);
 	bool babstract = ARG_BOOLEAN(abstract);
@@ -1205,17 +1724,9 @@ static void *make_unix_stream_core(const struct factory *factory, struct fdesc f
 
 	int ssd, csd, asd;	/* server, client, and accepted socket descriptors */
 	struct sockaddr_un un;
-	size_t un_len = sizeof(un);
+	size_t un_len;
 
-	memset(&un, 0, sizeof(un));
-	un.sun_family = AF_UNIX;
-	if (babstract) {
-		strncpy(un.sun_path + 1, spath, sizeof(un.sun_path) - 1 - 1);
-		size_t pathlen = strlen(spath);
-		if (sizeof(un.sun_path) - 1 > pathlen)
-			un_len = sizeof(un) - sizeof(un.sun_path) + 1 + pathlen;
-	} else
-		strncpy(un.sun_path,     spath, sizeof(un.sun_path) - 1    );
+	init_unix_addr(&un, &un_len, spath, babstract);
 
 	free_arg(&client_shutdown);
 	free_arg(&server_shutdown);
@@ -1345,6 +1856,110 @@ static void *make_unix_stream(const struct factory *factory, struct fdesc fdescs
 	return make_unix_stream_core(factory, fdescs, argc, argv, typesym, typestr);
 }
 
+static void *make_unix_stream_listen(const struct factory *factory, struct fdesc fdescs[],
+				     int argc, char ** argv)
+{
+	struct arg path = decode_arg("path", factory->params, argc, argv);
+	const char *spath = ARG_STRING(path);
+
+	struct arg backlog = decode_arg("backlog", factory->params, argc, argv);
+	int ibacklog = ARG_INTEGER(backlog);
+
+	struct arg abstract = decode_arg("abstract", factory->params, argc, argv);
+	bool babstract = ARG_BOOLEAN(abstract);
+
+	struct sockaddr_un un;
+	size_t un_len;
+	int sd;
+
+	init_unix_addr(&un, &un_len, spath, babstract);
+
+	free_arg(&abstract);
+	free_arg(&backlog);
+	free_arg(&path);
+
+	sd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sd < 0)
+		err(EXIT_FAILURE,
+		    "failed to make a socket with AF_UNIX + SOCK_STREAM (server side)");
+
+	if (sd != fdescs[0].fd) {
+		if (dup2(sd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", sd, fdescs[0].fd);
+		}
+		close(sd);
+		sd = fdescs[0].fd;
+	}
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_unix_socket,
+		.data  = NULL,
+	};
+
+	if (!babstract)
+		unlink(un.sun_path);
+	if (bind(sd, (const struct sockaddr *)&un, un_len) < 0) {
+		err(EXIT_FAILURE, "failed to bind a socket for listening");
+	}
+
+	if (!babstract)
+		fdescs[0].data = xstrdup(un.sun_path);
+
+	if (listen(sd, ibacklog) < 0) {
+		int e = errno;
+		close_unix_socket(sd, fdescs[0].data);
+		errno = e;
+		err(EXIT_FAILURE, "failed to listen a socket");
+	}
+
+	return NULL;
+}
+
+static void *make_unix_stream_connect(const struct factory *factory, struct fdesc fdescs[],
+				      int argc, char ** argv)
+{
+	struct arg path = decode_arg("path", factory->params, argc, argv);
+	const char *spath = ARG_STRING(path);
+
+	struct arg abstract = decode_arg("abstract", factory->params, argc, argv);
+	bool babstract = ARG_BOOLEAN(abstract);
+
+	struct sockaddr_un un;
+	size_t un_len;
+	int sd;
+
+	init_unix_addr(&un, &un_len, spath, babstract);
+
+	free_arg(&abstract);
+	free_arg(&path);
+
+	sd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sd < 0)
+		err(EXIT_FAILURE,
+		    "failed to make a socket with AF_UNIX + SOCK_STREAM (client side)");
+
+	if (sd != fdescs[0].fd) {
+		if (dup2(sd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", sd, fdescs[0].fd);
+		}
+		close(sd);
+		sd = fdescs[0].fd;
+	}
+
+	if (connect(sd, (const struct sockaddr *)&un, un_len) < 0) {
+		err(EXIT_FAILURE, "failed to connect a socket to the listening socket");
+	}
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc,
+		.data  = NULL,
+	};
+
+	return NULL;
+}
+
 static void *make_unix_dgram(const struct factory *factory, struct fdesc fdescs[],
 			     int argc, char ** argv)
 {
@@ -1357,17 +1972,9 @@ static void *make_unix_dgram(const struct factory *factory, struct fdesc fdescs[
 	int ssd, csd;	/* server and client socket descriptors */
 
 	struct sockaddr_un un;
-	size_t un_len = sizeof(un);
+	size_t un_len;
 
-	memset(&un, 0, sizeof(un));
-	un.sun_family = AF_UNIX;
-	if (babstract) {
-		strncpy(un.sun_path + 1, spath, sizeof(un.sun_path) - 1 - 1);
-		size_t pathlen = strlen(spath);
-		if (sizeof(un.sun_path) - 1 > pathlen)
-			un_len = sizeof(un) - sizeof(un.sun_path) + 1 + pathlen;
-	} else
-		strncpy(un.sun_path,     spath, sizeof(un.sun_path) - 1    );
+	init_unix_addr(&un, &un_len, spath, babstract);
 
 	free_arg(&abstract);
 	free_arg(&path);
@@ -1448,7 +2055,7 @@ static void *make_unix_in_new_netns(const struct factory *factory, struct fdesc 
 	const char *typestr;
 
 	struct sockaddr_un un;
-	size_t un_len = sizeof(un);
+	size_t un_len;
 
 	int self_netns, tmp_netns, sd;
 
@@ -1465,15 +2072,7 @@ static void *make_unix_in_new_netns(const struct factory *factory, struct fdesc 
 		errx(EXIT_FAILURE, "unknown unix socket type: %s", stype);
 	}
 
-	memset(&un, 0, sizeof(un));
-	un.sun_family = AF_UNIX;
-	if (babstract) {
-		strncpy(un.sun_path + 1, spath, sizeof(un.sun_path) - 1 - 1);
-		size_t pathlen = strlen(spath);
-		if (sizeof(un.sun_path) - 1 > pathlen)
-			un_len = sizeof(un) - sizeof(un.sun_path) + 1 + pathlen;
-	} else
-		strncpy(un.sun_path,     spath, sizeof(un.sun_path) - 1    );
+	init_unix_addr(&un, &un_len, spath, babstract);
 
 	free_arg(&abstract);
 	free_arg(&path);
@@ -1706,6 +2305,102 @@ static void *make_tcp_bare(const struct factory *factory _U_, struct fdesc fdesc
 		}
 		close(sd);
 		sd = fdescs[0].fd;
+	}
+
+	fdescs[0] = (struct fdesc) {
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc,
+		.data  = NULL,
+	};
+
+	return NULL;
+}
+
+static void *make_tcp_listen(const struct factory *factory, struct fdesc fdescs[],
+			     int argc, char ** argv)
+{
+	struct arg server_port = decode_arg("server-port", factory->params, argc, argv);
+	unsigned short iserver_port = (unsigned short)ARG_INTEGER(server_port);
+
+	struct arg backlog = decode_arg("backlog", factory->params, argc, argv);
+	int ibacklog = ARG_INTEGER(backlog);
+
+	struct arg reuseaddr = decode_arg("reuseaddr", factory->params, argc, argv);
+	bool breuseaddr = ARG_BOOLEAN(reuseaddr);
+
+	struct sockaddr_in sin;
+	int sd;
+
+	free_arg(&reuseaddr);
+	free_arg(&backlog);
+	free_arg(&server_port);
+
+	sd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sd < 0)
+		err(EXIT_FAILURE,
+		    "failed to make a tcp socket for listening");
+
+	if (breuseaddr) {
+		const int y = 1;
+		if (setsockopt(sd, SOL_SOCKET,
+			       SO_REUSEADDR, (const char *)&y, sizeof(y)) < 0) {
+			err(EXIT_FAILURE, "failed to setsockopt(SO_REUSEADDR)");
+		}
+	}
+
+	if (sd != fdescs[0].fd) {
+		if (dup2(sd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", sd, fdescs[0].fd);
+		}
+		close(sd);
+		sd = fdescs[0].fd;
+	}
+
+	tcp_init_addr((struct sockaddr *)&sin, iserver_port);
+	if (bind(sd, (const struct sockaddr *)&sin, sizeof(sin)) < 0) {
+		err(EXIT_FAILURE, "failed to bind a listening socket");
+	}
+
+	if (listen(sd, ibacklog) < 0) {
+		err(EXIT_FAILURE, "failed to listen a socket");
+	}
+
+	fdescs[0] = (struct fdesc) {
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc,
+		.data  = NULL,
+	};
+
+	return NULL;
+}
+
+static void *make_tcp_connect(const struct factory *factory, struct fdesc fdescs[],
+			      int argc, char ** argv)
+{
+	struct arg server_port = decode_arg("server-port", factory->params, argc, argv);
+	unsigned short iserver_port = (unsigned short)ARG_INTEGER(server_port);
+
+	struct sockaddr_in sin;
+	int sd;
+
+	free_arg(&server_port);
+
+	sd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sd < 0)
+		err(EXIT_FAILURE,
+		    "failed to make a tcp client socket");
+
+	if (sd != fdescs[0].fd) {
+		if (dup2(sd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", sd, fdescs[0].fd);
+		}
+		close(sd);
+		sd = fdescs[0].fd;
+	}
+
+	tcp_init_addr((struct sockaddr *)&sin, iserver_port);
+	if (connect(sd, (const struct sockaddr *)&sin, sizeof(sin)) < 0) {
+		err(EXIT_FAILURE, "failed to connect a client socket to the server socket");
 	}
 
 	fdescs[0] = (struct fdesc) {
@@ -2902,15 +3597,12 @@ static void free_bpf_prog(const struct factory * factory _U_, void *data)
 	free(data);
 }
 
-static void *make_some_pipes(const struct factory *factory _U_, struct fdesc fdescs[],
+static void *make_some_pipes(const struct factory *factory, struct fdesc fdescs[],
 			     int argc _U_, char ** argv _U_)
 {
-	/* Reserver fds before making pipes */
-	for (int i = 0; i < factory->N; i++) {
-		close(fdescs[i].fd);
-		if (dup2(0, fdescs[0].fd) < 0)
-			err(EXIT_FAILURE, "failed to reserve fd %d with dup2", fdescs[0].fd);
-	}
+	/* Reserve fds before making pipes */
+	for (int i = 0; i < factory->N; i++)
+		reserve_fd(fdescs[i].fd);
 
 	for (int i = 0; i < (factory->N) / 2; i++) {
 		int pd[2];
@@ -3000,6 +3692,247 @@ static void *make_bpf_map(const struct factory *factory, struct fdesc fdescs[],
 
 	return NULL;
 }
+
+#ifdef HAVE_BPF_LINK_CREATE
+static void *make_bpf_link(const struct factory *factory _U_, struct fdesc fdescs[],
+				int argc _U_, char ** argv _U_)
+{
+	int prog_fd, link_fd, cgroup_fd;
+	union bpf_attr attr;
+	struct bpf_link_info info = {};
+	/* Just doing exit with 1 (SK_PASS). */
+	struct bpf_insn insns[] = {
+		[0] = {
+			.code  = BPF_ALU64 | BPF_MOV | BPF_K,
+			.dst_reg = BPF_REG_0, .src_reg = 0, .off   = 0, .imm   = 1
+		},
+		[1] = {
+			.code  = BPF_JMP | BPF_EXIT,
+			.dst_reg = 0, .src_reg = 0, .off   = 0, .imm   = 0
+		},
+	};
+
+	memset(&attr, 0, sizeof(attr));
+	attr.prog_type = BPF_PROG_TYPE_CGROUP_SKB;
+	attr.insns = (uint64_t)(unsigned long)insns;
+	attr.insn_cnt = ARRAY_SIZE(insns);
+	attr.license = (int64_t)(unsigned long)"GPL";
+	prog_fd = syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+	if (prog_fd < 0)
+		err_nosys(EXIT_FAILURE, "failed in bpf(BPF_PROG_LOAD)");
+
+	cgroup_fd = open("/sys/fs/cgroup", O_RDONLY | O_DIRECTORY);
+	if (cgroup_fd < 0)
+		err_nosys(EXIT_FAILURE, "failed in open(/sys/fs/cgroup)");
+
+	memset(&attr, 0, sizeof(attr));
+	attr.link_create.prog_fd = prog_fd;
+	attr.link_create.target_fd = cgroup_fd;
+	attr.link_create.attach_type = BPF_CGROUP_INET_INGRESS;
+	link_fd = syscall(SYS_bpf, BPF_LINK_CREATE, &attr, sizeof(attr));
+	if (link_fd < 0) {
+		close(cgroup_fd);
+		close(prog_fd);
+		err_nosys(EXIT_FAILURE, "failed in bpf(BPF_LINK_CREATE)");
+	}
+
+	close(prog_fd);
+	close(cgroup_fd);
+
+	if (link_fd != fdescs[0].fd) {
+		if (dup2(link_fd, fdescs[0].fd) < 0)
+			err(EXIT_FAILURE, "failed to dup %d -> %d", link_fd, fdescs[0].fd);
+		close(link_fd);
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.info.bpf_fd = fdescs[0].fd;
+	attr.info.info_len = sizeof(info);
+	attr.info.info = (uint64_t)(unsigned long)&info;
+	if (syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) < 0)
+		err_nosys(EXIT_FAILURE, "failed in bpf(BPF_OBJ_GET_INFO_BY_FD)");
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc,
+		.data  = NULL
+	};
+
+	return xmemdup(&info, sizeof(info));
+}
+
+enum ritem_bpf_link {
+	RITEM_BPF_LINK_ID,
+	RITEM_BPF_LINK_PROG_ID,
+};
+
+static void report_bpf_link(const struct factory *factory _U_,
+				int nth, void *data, FILE *fp)
+{
+	struct bpf_link_info *info = data;
+
+	switch (nth) {
+	case RITEM_BPF_LINK_ID:
+		fprintf(fp, "%u", info->id);
+		break;
+	case RITEM_BPF_LINK_PROG_ID:
+		fprintf(fp, "%u", info->prog_id);
+		break;
+	}
+}
+
+static void free_bpf_link(const struct factory * factory _U_, void *data)
+{
+	free(data);
+}
+#endif /* HAVE_BPF_LINK_CREATE */
+#ifdef HAVE_BPF_F_MMAPABLE
+static void *make_mmapped_bpf_map(const struct factory *factory, struct fdesc fdescs[],
+				  int argc, char ** argv)
+{
+	struct arg name = decode_arg("name", factory->params, argc, argv);
+	const char *sname = ARG_STRING(name);
+
+	int bfd;
+	union bpf_attr attr;
+	struct munmap_data *munmap_data;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.map_flags = BPF_F_MMAPABLE;
+	attr.value_size = 4;
+	attr.key_size = 4;
+	attr.max_entries = 10;
+
+	strncpy(attr.map_name, sname, sizeof(attr.map_name) - 1);
+
+	free_arg(&name);
+
+	bfd = syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+	if (bfd < 0)
+		err_nosys(EXIT_FAILURE, "failed in bpf(BPF_MAP_CREATE)");
+
+	if (bfd != fdescs[0].fd) {
+		if (dup2(bfd, fdescs[0].fd) < 0) {
+			err(EXIT_FAILURE, "failed to dup %d -> %d", bfd, fdescs[0].fd);
+		}
+		close(bfd);
+	}
+
+	munmap_data = xmalloc(sizeof(*munmap_data));
+	munmap_data->len = 4096;
+	munmap_data->ptr = mmap(NULL, munmap_data->len,
+				PROT_READ | PROT_WRITE,
+				MAP_SHARED, fdescs[0].fd, 0);
+	if (munmap_data->ptr == MAP_FAILED)
+		err(EXIT_FAILURE, "failed to mmap bpf-map");
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc_after_munmap,
+		.data  = munmap_data,
+	};
+
+	return NULL;
+}
+#endif	/* HAVE_BPF_F_MMAPABLE */
+
+#ifdef HAVE_LINUX_IO_URING_H
+struct io_uring_data {
+	struct munmap_data sq_map;
+	struct munmap_data cq_map;
+	unsigned int sq_entries;
+	unsigned int cq_entries;
+};
+
+static void *make_io_uring(const struct factory *factory _U_, struct fdesc fdescs[],
+			   int argc _U_, char ** argv _U_)
+{
+	int fd;
+	void *sq_ptr, *cq_ptr;
+	size_t sq_size, cq_size;
+	struct io_uring_params params;
+	struct io_uring_data *data;
+
+	memset(&params, 0, sizeof(params));
+	fd = syscall(SYS_io_uring_setup, 4, &params);
+	if (fd < 0)
+		err_nosys(EXIT_FAILURE, "failed in io_uring_setup(2)");
+
+	if (fd != fdescs[0].fd) {
+		if (dup2(fd, fdescs[0].fd) < 0)
+			err(EXIT_FAILURE, "failed to dup %d -> %d",
+			    fd, fdescs[0].fd);
+		close(fd);
+	}
+
+	/*
+	 * mmap the SQ and CQ rings so that /proc/pid/maps will show
+	 * shm entries for this io_uring instance.
+	 */
+	sq_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
+	sq_ptr = mmap(NULL, sq_size, PROT_READ | PROT_WRITE,
+		      MAP_SHARED | MAP_POPULATE, fdescs[0].fd,
+		      IORING_OFF_SQ_RING);
+	if (sq_ptr == MAP_FAILED)
+		err(EXIT_FAILURE, "failed to mmap io_uring SQ ring");
+
+	cq_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+	cq_ptr = mmap(NULL, cq_size, PROT_READ | PROT_WRITE,
+		      MAP_SHARED | MAP_POPULATE, fdescs[0].fd,
+		      IORING_OFF_CQ_RING);
+	if (cq_ptr == MAP_FAILED)
+		err(EXIT_FAILURE, "failed to mmap io_uring CQ ring");
+
+	fdescs[0] = (struct fdesc){
+		.fd    = fdescs[0].fd,
+		.close = close_fdesc,
+		.data  = NULL,
+	};
+
+	/*
+	 * Store the actual queue entries count (the kernel may round
+	 * up to the next power of two).  The masks are entries-1.
+	 */
+	data = xmalloc(sizeof(*data));
+	data->sq_map.ptr = sq_ptr;
+	data->sq_map.len = sq_size;
+	data->cq_map.ptr = cq_ptr;
+	data->cq_map.len = cq_size;
+	data->sq_entries = params.sq_entries;
+	data->cq_entries = params.cq_entries;
+
+	return data;
+}
+
+enum ritem_io_uring {
+	RITEM_IO_URING_SQ_MASK,
+	RITEM_IO_URING_CQ_MASK,
+};
+
+static void report_io_uring(const struct factory *factory _U_,
+			    int nth, void *data, FILE *fp)
+{
+	struct io_uring_data *d = data;
+
+	switch (nth) {
+	case RITEM_IO_URING_SQ_MASK:
+		fprintf(fp, "0x%x", d->sq_entries - 1);
+		break;
+	case RITEM_IO_URING_CQ_MASK:
+		fprintf(fp, "0x%x", d->cq_entries - 1);
+		break;
+	}
+}
+
+static void free_io_uring(const struct factory * factory _U_, void *data)
+{
+	struct io_uring_data *d = data;
+	munmap(d->sq_map.ptr, d->sq_map.len);
+	munmap(d->cq_map.ptr, d->cq_map.len);
+	free(data);
+}
+#endif /* HAVE_LINUX_IO_URING_H */
 
 static void *make_pty(const struct factory *factory _U_, struct fdesc fdescs[],
 		      int argc _U_, char ** argv _U_)
@@ -3702,6 +4635,29 @@ static const struct factory factories[] = {
 		},
 	},
 	{
+		.name = "inotify-many",
+		.desc = "inotify fd monitoring multiple inodes",
+		.priv = false,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_inotify_fd_monitoring_multiple_inodes,
+		.params = (struct parameter []) {
+			{
+				.name = "tempdir",
+				.type = PTYPE_STRING,
+				.desc = "directory where temporary files to watch are created",
+				.defv.string = "",
+			},
+			{
+				.name = "count",
+				.type = PTYPE_INTEGER,
+				.desc = "number of temporary files to create and watch",
+				.defv.integer = 17,
+			},
+			PARAM_END
+		},
+	},
+	{
 		.name = "unix-stream",
 		.desc = "AF_UNIX+SOCK_STREAM sockets",
 		.priv = false,
@@ -3744,6 +4700,58 @@ static const struct factory factories[] = {
 				.type = PTYPE_STRING,
 				.desc = "stream or seqpacket",
 				.defv.string = "stream",
+			},
+			PARAM_END
+		},
+	},
+	{
+		.name = "unix-stream-listen",
+		.desc = "AF_UNIX+SOCK_STREAM listening socket (no connect)",
+		.priv = false,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_unix_stream_listen,
+		.params = (struct parameter []) {
+			{
+				.name = "path",
+				.type = PTYPE_STRING,
+				.desc = "path for listening-socket bound to",
+				.defv.string = "/tmp/test_mkfds-unix-stream-listen",
+			},
+			{
+				.name = "backlog",
+				.type = PTYPE_INTEGER,
+				.desc = "backlog passed to listen(2)",
+				.defv.integer = 5,
+			},
+			{
+				.name = "abstract",
+				.type = PTYPE_BOOLEAN,
+				.desc = "use PATH as an abstract socket address",
+				.defv.boolean = false,
+			},
+			PARAM_END
+		},
+	},
+	{
+		.name = "unix-stream-connect",
+		.desc = "AF_UNIX+SOCK_STREAM socket connected to PATH (no bind)",
+		.priv = false,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_unix_stream_connect,
+		.params = (struct parameter []) {
+			{
+				.name = "path",
+				.type = PTYPE_STRING,
+				.desc = "path of the listening-socket to connect to",
+				.defv.string = "/tmp/test_mkfds-unix-stream-listen",
+			},
+			{
+				.name = "abstract",
+				.type = PTYPE_BOOLEAN,
+				.desc = "use PATH as an abstract socket address",
+				.defv.boolean = false,
 			},
 			PARAM_END
 		},
@@ -3831,6 +4839,52 @@ static const struct factory factories[] = {
 		.EX_N = 0,
 		.make = make_tcp_bare,
 		.params = (struct parameter []) {
+			PARAM_END
+		}
+	},
+	{
+		.name = "tcp-listen",
+		.desc = "AF_INET+SOCK_STREAM listening socket (no connect)",
+		.priv = false,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_tcp_listen,
+		.params = (struct parameter []) {
+			{
+				.name = "server-port",
+				.type = PTYPE_INTEGER,
+				.desc = "TCP port the server listens on",
+				.defv.integer = 12345,
+			},
+			{
+				.name = "backlog",
+				.type = PTYPE_INTEGER,
+				.desc = "backlog passed to listen(2)",
+				.defv.integer = 5,
+			},
+			{
+				.name = "reuseaddr",
+				.type = PTYPE_BOOLEAN,
+				.desc = "set SO_REUSEADDR before bind(2)",
+				.defv.boolean = true,
+			},
+			PARAM_END
+		}
+	},
+	{
+		.name = "tcp-connect",
+		.desc = "AF_INET+SOCK_STREAM socket connected to SERVER-PORT (no bind)",
+		.priv = false,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_tcp_connect,
+		.params = (struct parameter []) {
+			{
+				.name = "server-port",
+				.type = PTYPE_INTEGER,
+				.desc = "TCP port the server listens on",
+				.defv.integer = 12345,
+			},
 			PARAM_END
 		}
 	},
@@ -4309,6 +5363,65 @@ static const struct factory factories[] = {
 			PARAM_END
 		}
 	},
+#ifdef HAVE_BPF_LINK_CREATE
+	{
+		.name = "bpf-link",
+		.desc = "make bpf-link",
+		.priv = true,
+		.N    = 1,
+		.EX_N = 0,
+		.EX_O = 2,
+		.make = make_bpf_link,
+		.report = report_bpf_link,
+		.free = free_bpf_link,
+		.params = (struct parameter []) {
+			PARAM_END
+		},
+		.o_descs = (const char *[]) {
+			[RITEM_BPF_LINK_ID]  = "the id of bpf link object",
+			[RITEM_BPF_LINK_PROG_ID] = "the id of bpf prog attached by the link",
+		},
+	},
+#endif
+#ifdef HAVE_BPF_F_MMAPABLE
+	{
+		.name = "mapped-bpf-map",
+		.desc = "mmap'ed bpf map",
+		.priv = true,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_mmapped_bpf_map,
+		.params = (struct parameter []) {
+			{
+				.name = "name",
+				.type = PTYPE_STRING,
+				.desc = "name assigned to the bpf map object",
+				.defv.string = "mkfds_bpf_map",
+			},
+			PARAM_END
+		}
+	},
+#endif	/* HAVE_BPF_F_MMAPABLE */
+#ifdef HAVE_LINUX_IO_URING_H
+	{
+		.name = "io_uring",
+		.desc = "make io_uring",
+		.priv = true,
+		.N    = 1,
+		.EX_N = 0,
+		.EX_O = 2,
+		.make = make_io_uring,
+		.report = report_io_uring,
+		.free = free_io_uring,
+		.params = (struct parameter []) {
+			PARAM_END
+		},
+		.o_descs = (const char *[]) {
+			[RITEM_IO_URING_SQ_MASK] = "the sq mask (entries-1)",
+			[RITEM_IO_URING_CQ_MASK] = "the cq mask (entries-1)",
+		},
+	},
+#endif
 	{
 		.name = "pty",
 		.desc = "make a pair of ptmx and pts",
@@ -4403,6 +5516,50 @@ static const struct factory factories[] = {
 			PARAM_END
 		}
 	},
+#ifdef HAVE_LIBFUSE
+	{
+		.name = "fuse-hungfs",
+		.desc = "open a file in user-mode file system reproducing process hangs",
+		.priv = true,
+		.N    = 1,
+		.EX_N = 0,
+		.make = make_fuse_hungfs,
+		.free = free_fuse_hungfs,
+		.params = (struct parameter []) {
+			{
+				.name = "mountpoint",
+				.type = PTYPE_STRING,
+				.desc = "mount point for fuse file system",
+				.defv.string = "./test_mkfds_fuse_mnt",
+			},
+			{
+				.name = "file",
+				.type = PTYPE_STRING,
+				.desc = "file to be opened in fuse mount",
+				.defv.string = "test_file",
+			},
+			{
+				.name = "hung",
+				.type = PTYPE_BOOLEAN,
+				.desc = "hang on getattr after open",
+				.defv.boolean = false,
+			},
+			{
+				.name = "hung-target",
+				.type = PTYPE_STRING,
+				.desc = "target node to hang on getattr: \"file\" (default), \"root\", or \"all\"",
+				.defv.string = "file",
+			},
+			{
+				.name = "mmap",
+				.type = PTYPE_BOOLEAN,
+				.desc = "mmap the opened file into memory privately (MAP_PRIVATE)",
+				.defv.boolean = false,
+			},
+			PARAM_END
+		},
+	},
+#endif	/* HAVE_LIBFUSE */
 };
 
 static int count_parameters(const struct factory *factory)
@@ -4416,22 +5573,113 @@ static int count_parameters(const struct factory *factory)
 	return p - factory->params;
 }
 
-static void print_factory(const struct factory *factory)
+struct colinfo {
+	const char *name;
+	double whint;
+	int flags;
+	const char *help;
+};
+
+static void list_items(const char *tbname,
+		       const struct colinfo * colinfos,
+		       size_t n_columns,
+		       const void * items,
+		       size_t n_items,
+		       int (* fill_column) (struct libscols_line *, int, const void *, int),
+		       const char *sort_key_name)
+
 {
-	printf("%-20s %4s %5d %7d %6d %s\n",
-	       factory->name,
-	       factory->priv? "yes": "no",
-	       factory->N,
-	       factory->EX_O + 1,
-	       count_parameters(factory),
-	       factory->desc);
+	struct libscols_table *tb;
+	struct libscols_column *col;
+	struct libscols_column *sort_key_col;
+
+	scols_init_debug(0);
+	tb = scols_new_table();
+	scols_table_set_name(tb, tbname);
+
+	for (size_t i = 0; i < n_columns; i++) {
+		const struct colinfo *colinfo = colinfos + i;
+		col = scols_table_new_column(tb, colinfo->name, colinfo->whint, colinfo->flags);
+		if (!col)
+			errx(EXIT_FAILURE, "failed to allocate output column");
+	}
+
+	for (size_t i = 0; i < n_items; i++) {
+		struct libscols_line *ln = scols_table_new_line(tb, NULL);
+		for (size_t j = 0; j < n_columns; j++) {
+			(* fill_column) (ln, i, items, j); /* TODO: retval */
+		}
+	}
+
+	if (sort_key_name) {
+		sort_key_col = scols_table_get_column_by_name(tb, sort_key_name);
+		assert(sort_key_col);
+		scols_column_set_cmpfunc(sort_key_col, scols_cmpstr_cells, NULL);
+		scols_sort_table(tb, sort_key_col);
+	}
+	scols_print_table(tb);
+	scols_unref_table(tb);
+}
+
+enum {
+	COL_FACTORY_NAME,
+	COL_FACTORY_PRIV,
+	COL_FACTORY_COUNT,
+	COL_FACTORY_NRETURN,
+	COL_FACTORY_NPARAM,
+	COL_FACTORY_DESCRIPTION,
+	FACTORY_N_COLS
+};
+
+static const struct colinfo factory_infos[] = {
+	[COL_FACTORY_NAME]        = { "FACTORY", 0, 0,
+				      "the name of factory" },
+	[COL_FACTORY_PRIV]        = { "PRIV", 0, SCOLS_FL_RIGHT,
+				      "whether root privilege is needed or not" },
+	[COL_FACTORY_COUNT]       = { "COUNT", 0, SCOLS_FL_RIGHT,
+				       "the number of file descriptors this factory may open" },
+	[COL_FACTORY_NRETURN]     = { "NRETURN", 0, SCOLS_FL_RIGHT,
+				      "the number of values the factory may returns via stdout" },
+	[COL_FACTORY_NPARAM]      = { "NPARAM", 0, SCOLS_FL_RIGHT,
+				      "the number of parameters the factory may takes from command line" },
+	[COL_FACTORY_DESCRIPTION] = { "DESCRIPTION", 0, 0,
+				      "the description about this factory" },
+};
+
+static int factory_fill_column(struct libscols_line *ln, int nth_item, const void *data,
+			       int nth_column)
+{
+	const struct factory *f = ((struct factory *)data) + nth_item;
+
+	switch (nth_column) {
+	case COL_FACTORY_NAME:
+		scols_line_sprintf(ln, nth_column, "%s", f->name);
+		break;
+	case COL_FACTORY_PRIV:
+		scols_line_sprintf(ln, nth_column, "%s", f->priv? "yes": "no");
+		break;
+	case COL_FACTORY_COUNT:
+		scols_line_sprintf(ln, nth_column, "%d", f->N);
+		break;
+	case COL_FACTORY_NRETURN:
+		scols_line_sprintf(ln, nth_column, "%d", f->EX_O + 1);
+		break;
+	case COL_FACTORY_NPARAM:
+		scols_line_sprintf(ln, nth_column, "%d", count_parameters(f));
+		break;
+	case COL_FACTORY_DESCRIPTION:
+		scols_line_sprintf(ln, nth_column, "%s", f->desc);
+		break;
+	}
+
+	return 0;
 }
 
 static void list_factories(void)
 {
-	printf("%-20s PRIV COUNT NRETURN NPARAM DESCRIPTION\n", "FACTORY");
-	for (size_t i = 0; i < ARRAY_SIZE(factories); i++)
-		print_factory(factories + i);
+	list_items ("factories", factory_infos, FACTORY_N_COLS,
+		    factories, ARRAY_SIZE(factories),
+		    factory_fill_column, factory_infos[COL_FACTORY_NAME].name);
 }
 
 static const struct factory *find_factory(const char *name)
@@ -4442,42 +5690,122 @@ static const struct factory *find_factory(const char *name)
 	return NULL;
 }
 
+enum {
+	COL_PARAMETER_NAME,
+	COL_PARAMETER_TYPE,
+	COL_PARAMETER_DEFAULT_VALUE,
+	COL_PARAMETER_DESCRIPTION,
+	PARAMETER_N_COLS
+};
+
+static const struct colinfo parameter_infos[] = {
+	[COL_PARAMETER_NAME]          = { "PARAMETER", 0, 0,
+					  "the name of parameter" },
+	[COL_PARAMETER_TYPE]          = { "TYPE", 0, SCOLS_FL_RIGHT,
+					  "data type of parameter: string, integer, uinteger, or boolean" },
+	[COL_PARAMETER_DEFAULT_VALUE] = { "DEFAULT_VALUE", 0, SCOLS_FL_RIGHT,
+					  "default value" },
+	[COL_PARAMETER_DESCRIPTION]   = { "DESCRIPTION", 0, 0,
+					  "the description about this parameter" },
+};
+
+static int parameter_fill_column(struct libscols_line *ln, int nth_item, const void *data,
+				 int nth_column)
+{
+	const struct parameter *p = ((struct parameter *)data) + nth_item;
+
+	switch (nth_column) {
+	case COL_PARAMETER_NAME:
+		scols_line_sprintf(ln, nth_column, "%s", p->name);
+		break;
+	case COL_PARAMETER_TYPE:
+		scols_line_sprintf(ln, nth_column, "%s", ptype_classes[p->type].name);
+		break;
+	case COL_PARAMETER_DEFAULT_VALUE: {
+		char *defv = ptype_classes[p->type].sprint(&p->defv);
+		scols_line_sprintf(ln, nth_column, "%s", defv);
+		free(defv);
+		break;
+	}
+	case COL_PARAMETER_DESCRIPTION:
+		scols_line_sprintf(ln, nth_column, "%s", p->desc);
+		break;
+	}
+
+	return 0;
+}
+
 static void list_parameters(const char *factory_name)
 {
-	const struct factory *factory = find_factory(factory_name);
-	const char *fmt = "%-15s %-8s %15s %s\n";
+	char *name = NULL;
+	size_t n_parameters = 0;
 
+	const struct factory *factory = find_factory(factory_name);
 	if (!factory)
 		errx(EXIT_FAILURE, "no such factory: %s", factory_name);
 
-	if (!factory->params)
-		return;
+	xasprintf(&name, "parameters of %s", factory_name);
 
-	printf(fmt, "PARAMETER", "TYPE", "DEFAULT_VALUE", "DESCRIPTION");
-	for (const struct parameter *p = factory->params; p->name != NULL; p++) {
-		char *defv = ptype_classes[p->type].sprint(&p->defv);
-		printf(fmt, p->name, ptype_classes[p->type].name, defv, p->desc);
-		free(defv);
+	if (factory->params) {
+		for (const struct parameter *p = factory->params; p->name != NULL; p++)
+			n_parameters++;
 	}
+
+	list_items (name, parameter_infos, PARAMETER_N_COLS,
+		    factory->params, n_parameters,
+		    parameter_fill_column,
+		    parameter_infos[COL_PARAMETER_NAME].name);
+	free(name);
+}
+
+enum {
+	COL_OVAL_NTH,
+	COL_OVAL_DESCRIPTION,
+	OVAL_N_COLS
+};
+
+static const struct colinfo output_value_infos[] = {
+	[COL_OVAL_NTH]         = { "NTH", 0, SCOLS_FL_RIGHT,
+				   "the order in the output list" },
+	[COL_OVAL_DESCRIPTION] = { "DESCRIPTION", 0, 0,
+				   "the description about this output item" },
+};
+
+static int output_values_fill_column(struct libscols_line *ln, int nth_item, const void *data,
+				     int nth_column)
+{
+	const char *o;
+
+	switch (nth_column) {
+	case COL_OVAL_NTH:
+		scols_line_sprintf(ln, nth_column, "%d", nth_item);
+		break;
+	case COL_OVAL_DESCRIPTION:
+		o = (nth_item == 0)
+			? "the pid owning the file descriptor(s)"
+			: ((const char *const * const)data)[nth_item - 1];
+		scols_line_sprintf(ln, nth_column, "%s", o);
+		break;
+	}
+	return 0;
 }
 
 static void list_output_values(const char *factory_name)
 {
+	char *name = NULL;
+	size_t n_ovals = 1;
 	const struct factory *factory = find_factory(factory_name);
-	const char *fmt = "%3d %s\n";
-	const char **o;
-
 	if (!factory)
 		errx(EXIT_FAILURE, "no such factory: %s", factory_name);
 
-	printf("%-3s %s\n", "NTH", "DESCRIPTION");
-	printf(fmt, 0, "the pid owning the file descriptor(s)");
+	xasprintf(&name, "output values of %s", factory_name);
 
-	o  = factory->o_descs;
-	if (!o)
-		return;
-	for (int i = 0; i < factory->EX_O; i++)
-		printf(fmt, i + 1, o[i]);
+	n_ovals += factory->EX_O;
+
+	list_items(name, output_value_infos, OVAL_N_COLS,
+		   factory->o_descs, n_ovals,
+		   output_values_fill_column, NULL);
+	free(name);
 }
 
 static void rename_self(const char *comm)
@@ -4495,7 +5823,12 @@ static void do_nothing(int signum _U_)
  */
 struct multiplexer {
 	const char *name;
-	void (*fn)(bool, struct fdesc *fdescs, size_t n_fdescs);
+
+	/*
+	 * Wait on fdescs and stdin. If tfd >= 0 (timerfd), returns true on
+	 * timeout expiry, or false otherwise.
+	 */
+	bool (*fn)(bool add_stdin, int tfd, struct fdesc *fdescs, size_t n_fdescs);
 };
 
 #if defined(__NR_select) || defined(__NR_poll)
@@ -4506,7 +5839,7 @@ static void sighandler_nop(int si _U_)
 #endif
 
 #define DEFUN_WAIT_EVENT_SELECT(NAME,SYSCALL,XDECLS,SETUP_SIG_HANDLER,SYSCALL_INVOCATION) \
-	static void wait_event_##NAME(bool add_stdin, struct fdesc *fdescs, size_t n_fdescs) \
+	static bool wait_event_##NAME(bool add_stdin, int tfd, struct fdesc *fdescs, size_t n_fdescs) \
 	{								\
 		fd_set readfds;						\
 		fd_set writefds;					\
@@ -4523,8 +5856,18 @@ static void sighandler_nop(int si _U_)
 			n = 1;						\
 			FD_SET(0, &readfds);				\
 		}							\
+		if (tfd >= 0) {						\
+			if (tfd >= FD_SETSIZE)				\
+				errx(EXIT_FAILURE,			\
+				     "timerfd fd %d exceeds FD_SETSIZE; use -w poll/ppoll", tfd); \
+			n = max(n, tfd + 1);				\
+			FD_SET(tfd, &readfds);				\
+		}							\
 									\
 		for (size_t i = 0; i < n_fdescs; i++) {			\
+			if (fdescs[i].fd >= FD_SETSIZE)			\
+				errx(EXIT_FAILURE,			\
+				     "fd %d exceeds FD_SETSIZE; use -w poll/ppoll", fdescs[i].fd); \
 			if (fdescs[i].mx_modes & MX_READ) {		\
 				n = max(n, fdescs[i].fd + 1);		\
 				FD_SET(fdescs[i].fd, &readfds);		\
@@ -4541,12 +5884,16 @@ static void sighandler_nop(int si _U_)
 									\
 		SETUP_SIG_HANDLER					\
 									\
-		if (SYSCALL_INVOCATION < 0				\
-		    && errno != EINTR) {				\
+		if (SYSCALL_INVOCATION < 0) {				\
+			if (errno == EINTR)				\
+				return false;				\
 			if (errno == ENOSYS)				\
 				errx(EXIT_ENOSYS, "no syscall: " SYSCALL); \
 			err(EXIT_FAILURE, "failed in " SYSCALL);	\
 		}							\
+		if (tfd >= 0 && FD_ISSET(tfd, &readfds))		\
+			return true;					\
+		return false;						\
 	}
 
 DEFUN_WAIT_EVENT_SELECT(default,
@@ -4621,11 +5968,34 @@ static struct multiplexer *lookup_multiplexer(const char *name)
 	return NULL;
 }
 
+enum {
+	COL_MULTIPLEXER_NAME,
+	MULTIPLEXER_N_COLS
+};
+
+static const struct colinfo multiplexer_infos[] = {
+	[COL_MULTIPLEXER_NAME] = { "MULTIPLEXER", 0, 0,
+				   "the name of multiplexer" },
+};
+
+static int multiplexer_fill_column(struct libscols_line *ln, int nth_item, const void *data,
+				   int nth_column)
+{
+	const struct multiplexer *m = ((struct multiplexer *)data) + nth_item;
+
+	switch (nth_column) {
+	case COL_MULTIPLEXER_NAME:
+		scols_line_sprintf(ln, nth_column, "%s", m->name);
+		break;
+	}
+	return 0;
+}
+
 static void list_multiplexers(void)
 {
-	puts("NAME");
-	for (size_t i = 0; i < ARRAY_SIZE(multiplexers); i++)
-		puts(multiplexers[i].name);
+	list_items ("multiplexers", multiplexer_infos, MULTIPLEXER_N_COLS,
+		    multiplexers, ARRAY_SIZE(multiplexers),
+		    multiplexer_fill_column, multiplexer_infos[COL_MULTIPLEXER_NAME].name);
 }
 
 static bool is_available(const char *factory)
@@ -4646,6 +6016,9 @@ int main(int argc, char **argv)
 	bool cont  = false;
 	void *data;
 	bool monitor_stdin = true;
+	unsigned int timeout = 0;
+	int tfd = -1;
+	bool expired = false;
 
 	struct multiplexer *wait_event = NULL;
 
@@ -4658,13 +6031,23 @@ int main(int argc, char **argv)
 		{ "quiet",	no_argument, NULL, 'q' },
 		{ "dont-monitor-stdin", no_argument, NULL, 'X' },
 		{ "dont-pause", no_argument, NULL, 'c' },
+		{ "timeout",	required_argument, NULL, 't' },
 		{ "wait-with",  required_argument, NULL, 'w' },
 		{ "multiplexers",no_argument,NULL, 'W' },
 		{ "help",	no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 
-	while ((c = getopt_long(argc, argv, "a:lhqcI:O:r:w:WX", longopts, NULL)) != -1) {
+	static const ul_excl_t excl[] = {
+		{ 'c', 't' },
+		{ 'c', 'w' },
+		{ 0 }
+	};
+	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
+
+	while ((c = getopt_long(argc, argv, "a:lhqcI:O:r:t:w:WX", longopts, NULL)) != -1) {
+		err_exclusive_options(c, longopts, excl, excl_st);
+
 		switch (c) {
 		case 'h':
 			usage(stdout, EXIT_SUCCESS);
@@ -4684,6 +6067,9 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			cont = true;
+			break;
+		case 't':
+			timeout = strtou32_or_err(optarg, "failed to parse timeout");
 			break;
 		case 'w':
 			wait_event = lookup_multiplexer(optarg);
@@ -4707,8 +6093,6 @@ int main(int argc, char **argv)
 	if (optind == argc)
 		errx(EXIT_FAILURE, "no file descriptor specification given");
 
-	if (cont && wait_event)
-		errx(EXIT_FAILURE, "don't specify both -c/--dont-puase and -w/--wait-with options");
 	if (wait_event == NULL)
 		wait_event = multiplexers + DEFAULT_MULTIPLEXER;
 
@@ -4756,6 +6140,8 @@ int main(int argc, char **argv)
 	}
 	optind += factory->N;
 
+	validate_factory_arguments(factory, argc - optind, argv + optind);
+
 	data = factory->make(factory, fdescs, argc - optind, argv + optind);
 
 	signal(SIGCONT, do_nothing);
@@ -4772,9 +6158,23 @@ int main(int argc, char **argv)
 		fflush(stdout);
 	}
 
+	if (timeout > 0) {
+		tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+		if (tfd < 0)
+			err(EXIT_FAILURE, "failed in timerfd_create(2)");
+		if (timerfd_settime(tfd, 0, &(struct itimerspec){
+					.it_value = { .tv_sec = timeout, .tv_nsec = 0 },
+					.it_interval = { 0, 0 }
+				}, NULL) < 0)
+			err(EXIT_FAILURE, "failed in timerfd_settime(2)");
+	}
+
 	if (!cont)
-		wait_event->fn(monitor_stdin,
-			       fdescs, factory->N + factory->EX_N);
+		expired = wait_event->fn(monitor_stdin, tfd,
+					 fdescs, factory->N + factory->EX_N);
+
+	if (tfd >= 0)
+		close(tfd);
 
 	for (int i = 0; i < factory->N + factory->EX_N; i++)
 		if (fdescs[i].fd >= 0 && fdescs[i].close)
@@ -4782,6 +6182,9 @@ int main(int argc, char **argv)
 
 	if (factory->free)
 		factory->free(factory, data);
+
+	if (expired)
+		errx(EXIT_EXPIRED, "timed out after %u seconds", timeout);
 
 	exit(EXIT_SUCCESS);
 }

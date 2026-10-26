@@ -47,7 +47,7 @@ EXPR=
     coproc MKFDS { "$TS_HELPER_MKFDS" pipe-no-fork $FD0 $FD1 nonblock=-w rdup=$((FD0 + 2)) wdup=$((FD1 + 2)); }
     if read -u ${MKFDS[0]} PID; then
 	EXPR='(PID == '"${PID}"') and ((FD == '"$FD0"') or (FD =='"$FD1"'))'
-	${TS_CMD_LSFD} -n -o ASSOC,MODE,TYPE,SOURCE,FLAGS -Q "${EXPR}"
+	${TS_CMD_LSFD} -r -n -o ASSOC,MODE,TYPE,SOURCE,FLAGS -Q "${EXPR}"
 	echo 'ASSOC,MODE,TYPE,SOURCE,FLAGS': $?
 
 	LSFD_PIDS=$(${TS_CMD_LSFD} --raw -n -o PID -Q "${EXPR}")
@@ -94,7 +94,7 @@ EXPR=
 	fi
 
 	EXPR='(PID == '"${PID}"') and (FD == '"$FD0"')'
-	LSFD_ENDPOINTS_JSON=$(${TS_CMD_LSFD} -J --raw -n -o ASSOC,ENDPOINTS -Q "${EXPR}")
+	LSFD_ENDPOINTS_JSON=$(${TS_CMD_LSFD} -J -n -o ASSOC,ENDPOINTS -Q "${EXPR}")
 	echo 'ASSOC,ENDPOINTS (JSON)': $?
 	EXPECTED_LSFD_ENDPOINTS_JSON=$(cat<<EOF
 {

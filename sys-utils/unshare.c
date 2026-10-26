@@ -115,14 +115,14 @@ static void setgroups_control(int action)
 		return;
 	cmd = setgroups_strings[action];
 
-	fd = open(file, O_WRONLY);
+	fd = open(file, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return;
 		err(EXIT_FAILURE, _("cannot open %s"), file);
 	}
 
-	if (write_all(fd, cmd, strlen(cmd)))
+	if (ul_write_all(fd, cmd, strlen(cmd)))
 		err(EXIT_FAILURE, _("write failed %s"), file);
 	close(fd);
 }
@@ -132,12 +132,12 @@ static void map_id(const char *file, uint32_t from, uint32_t to)
 	char *buf;
 	int fd;
 
-	fd = open(file, O_WRONLY);
+	fd = open(file, O_WRONLY | O_CLOEXEC);
 	if (fd < 0)
 		 err(EXIT_FAILURE, _("cannot open %s"), file);
 
 	xasprintf(&buf, "%u %u 1", from, to);
-	if (write_all(fd, buf, strlen(buf)))
+	if (ul_write_all(fd, buf, strlen(buf)))
 		err(EXIT_FAILURE, _("write failed %s"), file);
 	free(buf);
 	close(fd);
@@ -227,7 +227,7 @@ static void settime(int64_t offset, clockid_t clk_id)
 
 	len = snprintf(buf, sizeof(buf), "%d %" PRId64 " 0", clk_id, offset);
 
-	fd = open("/proc/self/timens_offsets", O_WRONLY);
+	fd = open("/proc/self/timens_offsets", O_WRONLY | O_CLOEXEC);
 	if (fd < 0)
 		err(EXIT_FAILURE, _("failed to open /proc/self/timens_offsets"));
 
@@ -273,7 +273,7 @@ static void sync_with_child(pid_t pid, int fd)
 {
 	uint64_t ch = PIPE_SYNC_BYTE;
 
-	write_all(fd, &ch, sizeof(ch));
+	ul_write_all(fd, &ch, sizeof(ch));
 	close(fd);
 
 	waitchild(pid);
@@ -297,7 +297,7 @@ static pid_t fork_and_wait(int *fd)
 	pid_t pid;
 	uint64_t ch;
 
-	*fd = eventfd(0, 0);
+	*fd = eventfd(0, EFD_CLOEXEC);
 	if (*fd < 0)
 		err(EXIT_FAILURE, _("eventfd failed"));
 
@@ -307,7 +307,7 @@ static pid_t fork_and_wait(int *fd)
 
 	if (!pid) {
 		/* wait for the our parent to tell us to continue */
-		if (read_all(*fd, (char *)&ch, sizeof(ch)) != sizeof(ch) ||
+		if (ul_read_all(*fd, (char *)&ch, sizeof(ch)) != sizeof(ch) ||
 		    ch != PIPE_SYNC_BYTE)
 			err(EXIT_FAILURE, _("failed to read eventfd"));
 		close(*fd);
@@ -418,7 +418,7 @@ static struct map_range read_subid_range(char *filename, uid_t uid, int identity
 	if (!pw)
 		errx(EXIT_FAILURE, _("you (user %u) don't exist."), uid);
 
-	idmap = fopen(filename, "r");
+	idmap = fopen(filename, "r" UL_CLOEXECSTR);
 	if (!idmap)
 		err(EXIT_FAILURE, _("could not open '%s'"), filename);
 
@@ -482,7 +482,7 @@ static void read_kernel_map(struct map_range **chain, char *filename)
 	size_t size = 0;
 	FILE *idmap;
 
-	idmap = fopen(filename, "r");
+	idmap = fopen(filename, "r" UL_CLOEXECSTR);
 	if (!idmap)
 		err(EXIT_FAILURE, _("could not open '%s'"), filename);
 
@@ -535,15 +535,14 @@ static void add_single_map_range(struct map_range **chain, unsigned int outer,
 				 *next = map->next;
 		unsigned int inner_offset, outer_offset;
 
-		/* Start inner IDs from zero for an auto mapping */
+		/*
+		 * Start inner IDs from zero for an auto mapping; otherwise,
+		 * if the single mapping exists and overlaps the range,
+		 * remove an ID
+		 */
 		if (map->inner + 1 == 0)
 			map->inner = 0;
-
-		/*
-		 * If the single mapping exists and overlaps the range, remove
-		 * an ID
-		 */
-		if (inner + 1 != 0 &&
+		else if (inner + 1 != 0 &&
 		    ((outer >= map->outer && outer <= map->outer + map->count) ||
 		     (inner >= map->inner && inner <= map->inner + map->count)))
 			map->count--;
@@ -661,7 +660,7 @@ static void map_ids_internal(const char *type, int ppid, struct map_range *chain
 	fd = open(path, O_WRONLY | O_CLOEXEC | O_NOCTTY);
 	if (fd < 0)
 		err(EXIT_FAILURE, _("failed to open %s"), path);
-	if (write_all(fd, buffer, length) < 0)
+	if (ul_write_all(fd, buffer, length) < 0)
 		err(EXIT_FAILURE, _("failed to write %s"), path);
 	close(fd);
 	free(path);
@@ -726,15 +725,15 @@ static void load_interp(const char *binfmt_mnt, const char *interp)
 {
 	int dirfd, fd;
 
-	dirfd = open(binfmt_mnt, O_PATH | O_DIRECTORY);
+	dirfd = open(binfmt_mnt, O_PATH | O_DIRECTORY | O_CLOEXEC);
 	if (dirfd < 0)
 		err(EXIT_FAILURE, _("cannot open %s"), binfmt_mnt);
 
-	fd = openat(dirfd, "register", O_WRONLY);
+	fd = openat(dirfd, "register", O_WRONLY | O_CLOEXEC);
 	if (fd < 0)
 		err(EXIT_FAILURE, _("cannot open %s/register"), binfmt_mnt);
 
-	if (write_all(fd, interp, strlen(interp)))
+	if (ul_write_all(fd, interp, strlen(interp)))
 		err(EXIT_FAILURE, _("write failed %s/register"), binfmt_mnt);
 
 	close(fd);

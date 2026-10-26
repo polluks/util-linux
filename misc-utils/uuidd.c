@@ -30,7 +30,6 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <errno.h>
-#include <err.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -53,7 +52,7 @@
 #include "timer.h"
 
 #ifdef HAVE_LIBSYSTEMD
-# include <systemd/sd-daemon.h>
+# include "dl-systemd.h"
 #endif
 
 #include "nls.h"
@@ -178,7 +177,7 @@ static int call_daemon(const char *socket_path, uuidd_prot_op_t op, char *buf,
 		op_len += sizeof(*num);
 	}
 
-	ret = write_all(s, op_buf, op_len);
+	ret = ul_write_all(s, op_buf, op_len);
 	if (ret < 0) {
 		if (err_context)
 			*err_context = _("write");
@@ -186,7 +185,7 @@ static int call_daemon(const char *socket_path, uuidd_prot_op_t op, char *buf,
 		return -1;
 	}
 
-	ret = read_all(s, (char *) &reply_len, sizeof(reply_len));
+	ret = ul_read_all(s, (char *) &reply_len, sizeof(reply_len));
 	if (ret < 0) {
 		if (err_context)
 			*err_context = _("read count");
@@ -199,7 +198,7 @@ static int call_daemon(const char *socket_path, uuidd_prot_op_t op, char *buf,
 		close(s);
 		return -1;
 	}
-	ret = read_all(s, (char *) buf, reply_len);
+	ret = ul_read_all(s, (char *) buf, reply_len);
 
 	if ((ret > 0) && (op == UUIDD_OP_BULK_TIME_UUID)) {
 		if ((sizeof(uuid_t) + sizeof(*num)) <= (size_t) reply_len)
@@ -402,7 +401,7 @@ static void server_loop(const char *socket_path, const char *pidfile_path,
 			snprintf(reply_buf, sizeof(reply_buf), "%8d\n", getpid());
 			if (ftruncate(fd_pidfile, 0))
 				err(EXIT_FAILURE, _("could not truncate file: %s"), pidfile_path);
-			write_all(fd_pidfile, reply_buf, strlen(reply_buf));
+			ul_write_all(fd_pidfile, reply_buf, strlen(reply_buf));
 			if (fd_pidfile > 1 && close_fd(fd_pidfile) != 0)
 				err(EXIT_FAILURE, _("write failed: %s"), pidfile_path);
 		}
@@ -411,7 +410,8 @@ static void server_loop(const char *socket_path, const char *pidfile_path,
 
 #ifdef HAVE_LIBSYSTEMD
 	if (uuidd_cxt->no_sock) {
-		const int r = sd_listen_fds(0);
+		const int r = ul_dlopen_libsystemd() == 0 ?
+				systemd_call(sd_listen_fds)(0) : -ENOSYS;
 
 		if (r < 0) {
 			errno = r * -1;
@@ -443,9 +443,15 @@ static void server_loop(const char *socket_path, const char *pidfile_path,
 	pfd[POLLFD_SIGNAL].events = pfd[POLLFD_SOCKET].events = POLLIN | POLLERR | POLLHUP;
 
 	while (1) {
-		ret = poll(pfd, ARRAY_SIZE(pfd),
-				uuidd_cxt->timeout ?
-					(int) uuidd_cxt->timeout * 1000 : -1);
+		int poll_timeout = -1;
+
+		if (uuidd_cxt->timeout) {
+			msec_t msec = (msec_t) uuidd_cxt->timeout * MSEC_PER_SEC;
+
+			poll_timeout = msec > INT_MAX ? INT_MAX : (int) msec;
+		}
+
+		ret = poll(pfd, ARRAY_SIZE(pfd), poll_timeout);
 		if (ret < 0) {
 			if (errno == EAGAIN)
 				continue;
@@ -479,7 +485,7 @@ static void server_loop(const char *socket_path, const char *pidfile_path,
 		}
 		if ((op == UUIDD_OP_BULK_TIME_UUID) ||
 		    (op == UUIDD_OP_BULK_RANDOM_UUID)) {
-			if (read_all(ns, (char *) &num, sizeof(num)) != sizeof(num))
+			if (ul_read_all(ns, (char *) &num, sizeof(num)) != sizeof(num))
 				goto shutdown_socket;
 			if (uuidd_cxt->debug)
 				fprintf(stderr, _("operation %d, incoming num = %d\n"),
@@ -560,8 +566,8 @@ static void server_loop(const char *socket_path, const char *pidfile_path,
 				fprintf(stderr, _("Invalid operation %d\n"), op);
 			goto shutdown_socket;
 		}
-		write_all(ns, (char *) &reply_len, sizeof(num));
-		write_all(ns, reply_buf, reply_len);
+		ul_write_all(ns, (char *) &reply_len, sizeof(num));
+		ul_write_all(ns, reply_buf, reply_len);
 	shutdown_socket:
 		close(ns);
 	}

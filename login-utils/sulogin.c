@@ -45,8 +45,7 @@
 #endif
 
 #ifdef HAVE_LIBSELINUX
-# include <selinux/selinux.h>
-# include <selinux/get_context_list.h>
+# include "dl-selinux.h"
 #endif
 
 #ifdef __linux__
@@ -56,6 +55,7 @@
 #endif
 
 #include "c.h"
+#include "timeutils.h"
 #include "closestream.h"
 #include "env.h"
 #include "nls.h"
@@ -107,8 +107,12 @@ static int is_selinux_enabled_cached(void)
 {
 	static int cache = -1;
 
-	if (cache == -1)
-		cache = is_selinux_enabled();
+	if (cache == -1) {
+		if (ul_dlopen_libselinux() == 0)
+			cache = selinux_call(is_selinux_enabled)();
+		else
+			cache = 0;
+	}
 
 	return cache;
 }
@@ -127,12 +131,12 @@ static void compute_login_context(void)
 	if (is_selinux_enabled_cached() == 0)
 		goto cleanup;
 
-	if (getseuserbyname("root", &seuser, &level) == -1) {
+	if (selinux_call(getseuserbyname)("root", &seuser, &level) == -1) {
 		warnx(_("failed to compute seuser"));
 		goto cleanup;
 	}
 
-	if (get_default_context_with_level(seuser, level, NULL, &login_context) == -1) {
+	if (selinux_call(get_default_context_with_level)(seuser, level, NULL, &login_context) == -1) {
 		warnx(_("failed to compute default context"));
 		goto cleanup;
 	}
@@ -152,22 +156,22 @@ static void tcinit_selinux(struct console *con)
 	if (!login_context)
 		return;
 
-	if (fgetfilecon(con->fd, &con->reset_tty_context) == -1) {
+	if (selinux_call(fgetfilecon)(con->fd, &con->reset_tty_context) == -1) {
 		warn(_("failed to get context of terminal %s"), con->tty);
 		return;
 	}
 
-	tclass = string_to_security_class("chr_file");
+	tclass = selinux_call(string_to_security_class)("chr_file");
 	if (tclass == 0) {
 		warnx(_("security class chr_file not available"));
-		freecon(con->reset_tty_context);
+		selinux_call(freecon)(con->reset_tty_context);
 		con->reset_tty_context = NULL;
 		return;
 	}
 
-	if (security_compute_relabel(login_context, con->reset_tty_context, tclass, &con->user_tty_context) == -1) {
+	if (selinux_call(security_compute_relabel)(login_context, con->reset_tty_context, tclass, &con->user_tty_context) == -1) {
 		warnx(_("failed to compute relabel context of terminal"));
-		freecon(con->reset_tty_context);
+		selinux_call(freecon)(con->reset_tty_context);
 		con->reset_tty_context = NULL;
 		return;
 	}
@@ -573,7 +577,7 @@ static struct passwd *getrootpwent(int try_manually)
 	pwd.pw_uid = 0;
 	pwd.pw_gid = 0;
 
-	if ((fp = fopen(_PATH_PASSWD, "r")) == NULL) {
+	if ((fp = fopen(_PATH_PASSWD, "r" UL_CLOEXECSTR)) == NULL) {
 		warn(_("cannot open %s"), _PATH_PASSWD);
 		return &pwd;
 	}
@@ -610,7 +614,7 @@ static struct passwd *getrootpwent(int try_manually)
 	 * The password is invalid. If there is a shadow password, try it.
 	 */
 	*pwd.pw_passwd = '\0';
-	if ((fp = fopen(_PATH_SHADOW_PASSWD, "r")) == NULL) {
+	if ((fp = fopen(_PATH_SHADOW_PASSWD, "r" UL_CLOEXECSTR)) == NULL) {
 		warn(_("cannot open %s"), _PATH_PASSWD);
 		return &pwd;
 	}
@@ -926,12 +930,12 @@ static void sushell(struct passwd *pwd, struct console *con)
 #ifdef HAVE_LIBSELINUX
 	if (is_selinux_enabled_cached() == 1) {
 		if (con->user_tty_context) {
-			if (fsetfilecon(con->fd, con->user_tty_context) == -1)
+			if (selinux_call(fsetfilecon)(con->fd, con->user_tty_context) == -1)
 				warn(_("failed to set context to %s for terminal %s"), con->user_tty_context, con->tty);
 		}
 
 		if (login_context) {
-			if (setexeccon(login_context) == -1)
+			if (selinux_call(setexeccon)(login_context) == -1)
 				warn(_("failed to set exec context to %s"), login_context);
 		}
 	}
@@ -963,10 +967,10 @@ static void tcreset_selinux(struct list_head *consoles)
 			continue;
 		if (!con->reset_tty_context)
 			continue;
-		if (fsetfilecon(con->fd, con->reset_tty_context) == -1)
+		if (selinux_call(fsetfilecon)(con->fd, con->reset_tty_context) == -1)
 			warn(_("failed to reset context to %s for terminal %s"), con->reset_tty_context, con->tty);
 
-		freecon(con->reset_tty_context);
+		selinux_call(freecon)(con->reset_tty_context);
 		con->reset_tty_context = NULL;
 	}
 }
@@ -1054,7 +1058,11 @@ int main(int argc, char **argv)
 				"emergency-mount",
 #endif
 #ifdef HAVE_LIBSELINUX
+# ifdef USE_DLOPEN_SELINUX
+				"selinux(dlopen)",
+# else
 				"selinux",
+# endif
 #endif
 #ifdef USE_PLYMOUTH_SUPPORT
 				"plymouth",
@@ -1152,7 +1160,7 @@ int main(int argc, char **argv)
 			tcinit(con);
 			continue;
 		}
-		if ((con->fd = open(con->tty, O_RDWR | O_NOCTTY | O_NONBLOCK)) < 0)
+		if ((con->fd = open(con->tty, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)) < 0)
 			continue;
 		openfd |= (1 << con->fd);
 		tcinit(con);

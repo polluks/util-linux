@@ -54,6 +54,24 @@
 #ifndef PR_GET_NO_NEW_PRIVS
 # define PR_GET_NO_NEW_PRIVS 39
 #endif
+#ifndef SECBIT_NO_CAP_AMBIENT_RAISE
+# define SECBIT_NO_CAP_AMBIENT_RAISE (1 << 6)
+#endif
+#ifndef SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED
+# define SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED (1 << 7)
+#endif
+#ifndef SECBIT_EXEC_RESTRICT_FILE
+# define SECBIT_EXEC_RESTRICT_FILE (1 << 8)
+#endif
+#ifndef SECBIT_EXEC_RESTRICT_FILE_LOCKED
+# define SECBIT_EXEC_RESTRICT_FILE_LOCKED (1 << 9)
+#endif
+#ifndef SECBIT_EXEC_DENY_INTERACTIVE
+# define SECBIT_EXEC_DENY_INTERACTIVE (1 << 10)
+#endif
+#ifndef SECBIT_EXEC_DENY_INTERACTIVE_LOCKED
+# define SECBIT_EXEC_DENY_INTERACTIVE_LOCKED (1 << 11)
+#endif
 
 #define SETPRIV_EXIT_PRIVERR 127	/* how we exit when we fail to set privs */
 
@@ -155,6 +173,10 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" --apparmor-profile <pr>     set AppArmor profile\n"), out);
 	fputs(_(" --landlock-access <access>  add Landlock access\n"), out);
 	fputs(_(" --landlock-rule <rule>      add Landlock rule\n"), out);
+	fputs(_(" --landlock-support          list supported Landlock ABI, access, rights, and rules\n"), out);
+	fputs(_(" --list-landlock-access      list Landlock access categories\n"), out);
+	fputs(_(" --list-landlock-rights <access>\n"
+		"                             list an access category's rights\n"), out);
 	fputs(_(" --seccomp-filter <file>     load seccomp filter from file\n"), out);
 	fputs(_(" --reset-env                 clear all environment and initialize\n"
 		"                               HOME, SHELL, USER, LOGNAME and PATH\n"), out);
@@ -246,6 +268,18 @@ static void dump_securebits(void)
 	bits &= ~SECBIT_KEEP_CAPS;
 	dump_one_secbit(&first, &bits, SECBIT_KEEP_CAPS_LOCKED,
 			"keep_caps_locked");
+	dump_one_secbit(&first, &bits, SECBIT_NO_CAP_AMBIENT_RAISE,
+			"no_cap_ambient_raise");
+	dump_one_secbit(&first, &bits, SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
+			"no_cap_ambient_raise_locked");
+	dump_one_secbit(&first, &bits, SECBIT_EXEC_RESTRICT_FILE,
+			"exec_restrict_file");
+	dump_one_secbit(&first, &bits, SECBIT_EXEC_RESTRICT_FILE_LOCKED,
+			"exec_restrict_file_locked");
+	dump_one_secbit(&first, &bits, SECBIT_EXEC_DENY_INTERACTIVE,
+			"exec_deny_interactive");
+	dump_one_secbit(&first, &bits, SECBIT_EXEC_DENY_INTERACTIVE_LOCKED,
+			"exec_deny_interactive_locked");
 	if (bits) {
 		if (first)
 			first = 0;
@@ -266,7 +300,7 @@ static void dump_label(const char *name)
 	ssize_t len;
 	int fd, e;
 
-	fd = open(_PATH_PROC_ATTR_CURRENT, O_RDONLY);
+	fd = open(_PATH_PROC_ATTR_CURRENT, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		warn(_("cannot open %s"), _PATH_PROC_ATTR_CURRENT);
 		return;
@@ -621,6 +655,18 @@ static void parse_securebits(struct privctx *opts, const char *arg)
 				     _("adjusting keep_caps does not make sense"));
 			else if (!strcmp(c + 1, "keep_caps_locked"))
 				bit = SECBIT_KEEP_CAPS_LOCKED;	/* sigh */
+			else if (!strcmp(c + 1, "no_cap_ambient_raise"))
+				bit = SECBIT_NO_CAP_AMBIENT_RAISE;
+			else if (!strcmp(c + 1, "no_cap_ambient_raise_locked"))
+				bit = SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+			else if (!strcmp(c + 1, "exec_restrict_file"))
+				bit = SECBIT_EXEC_RESTRICT_FILE;
+			else if (!strcmp(c + 1, "exec_restrict_file_locked"))
+				bit = SECBIT_EXEC_RESTRICT_FILE_LOCKED;
+			else if (!strcmp(c + 1, "exec_deny_interactive"))
+				bit = SECBIT_EXEC_DENY_INTERACTIVE;
+			else if (!strcmp(c + 1, "exec_deny_interactive_locked"))
+				bit = SECBIT_EXEC_DENY_INTERACTIVE_LOCKED;
 			else
 				errx(EXIT_FAILURE, _("unrecognized securebit"));
 
@@ -644,7 +690,7 @@ static void do_selinux_label(const char *label)
 	if (access(_PATH_SYS_SELINUX, F_OK) != 0)
 		errx(SETPRIV_EXIT_PRIVERR, _("SELinux is not running"));
 
-	fd = open(_PATH_PROC_ATTR_EXEC, O_RDWR);
+	fd = open(_PATH_PROC_ATTR_EXEC, O_RDWR | O_CLOEXEC);
 	if (fd == -1)
 		err(SETPRIV_EXIT_PRIVERR,
 		    _("cannot open %s"), _PATH_PROC_ATTR_EXEC);
@@ -672,10 +718,10 @@ static void do_apparmor_profile(const char *label)
 	 * See https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/lsm.rst
 	 */
 	path = _PATH_PROC_ATTR_APPARMOR_EXEC;
-	f = fopen(path, "r+");
+	f = fopen(path, "r+" UL_CLOEXECSTR);
 	if (!f) {
 		path = _PATH_PROC_ATTR_EXEC;
-		f = fopen(path, "r+");
+		f = fopen(path, "r+" UL_CLOEXECSTR);
 	}
 	if (!f)
 		err(SETPRIV_EXIT_PRIVERR,
@@ -695,12 +741,12 @@ static void do_seccomp_filter(const char *file)
 	char *filter;
 	struct sock_fprog prog = {};
 
-	fd = open(file, O_RDONLY);
+	fd = open(file, O_RDONLY | O_CLOEXEC);
 	if (fd == -1)
 		err(SETPRIV_EXIT_PRIVERR,
 		    _("cannot open %s"), file);
 
-	s = read_all_alloc(fd, &filter);
+	s = ul_read_all_alloc(fd, &filter);
 	if (s < 0)
 		err(SETPRIV_EXIT_PRIVERR,
 		    _("cannot read %s"), file);
@@ -832,6 +878,9 @@ int main(int argc, char **argv)
 		APPARMOR_PROFILE,
 		LANDLOCK_ACCESS,
 		LANDLOCK_RULE,
+		LANDLOCK_SUPPORT,
+		LIST_LANDLOCK_ACCESS,
+		LIST_LANDLOCK_RIGHTS,
 		SECCOMP_FILTER,
 		RESET_ENV
 	};
@@ -861,6 +910,9 @@ int main(int argc, char **argv)
 		{ "apparmor-profile", required_argument, NULL, APPARMOR_PROFILE },
 		{ "landlock-access",  required_argument, NULL, LANDLOCK_ACCESS  },
 		{ "landlock-rule",    required_argument, NULL, LANDLOCK_RULE    },
+		{ "landlock-support", no_argument,       NULL, LANDLOCK_SUPPORT },
+		{ "list-landlock-access", no_argument,       NULL, LIST_LANDLOCK_ACCESS },
+		{ "list-landlock-rights", required_argument, NULL, LIST_LANDLOCK_RIGHTS },
 		{ "seccomp-filter",   required_argument, NULL, SECCOMP_FILTER   },
 		{ "help",             no_argument,       NULL, 'h'              },
 		{ "reset-env",        no_argument,       NULL, RESET_ENV,       },
@@ -881,6 +933,9 @@ int main(int argc, char **argv)
 	int dumplevel = 0;
 	int total_opts = 0;
 	int list_caps = 0;
+	int landlock_support = 0;
+	int landlock_list_access = 0;
+	const char *landlock_list_rights_access = NULL;
 
 	setlocale(LC_ALL, "");
 	bindtextdomain(PACKAGE, LOCALEDIR);
@@ -975,7 +1030,7 @@ int main(int argc, char **argv)
 		case PDEATHSIG:
 			if (opts.pdeathsig)
 				errx(EXIT_FAILURE,
-				     _("duplicate --keep-pdeathsig option"));
+				     _("duplicate --pdeathsig option"));
 			parse_pdeathsig(&opts, optarg);
 			break;
 		case PTRACER:
@@ -1030,6 +1085,15 @@ int main(int argc, char **argv)
 		case LANDLOCK_RULE:
 			parse_landlock_rule(&opts.landlock, optarg);
 			break;
+		case LANDLOCK_SUPPORT:
+			landlock_support = 1;
+			break;
+		case LIST_LANDLOCK_ACCESS:
+			landlock_list_access = 1;
+			break;
+		case LIST_LANDLOCK_RIGHTS:
+			landlock_list_rights_access = optarg;
+			break;
 		case SECCOMP_FILTER:
 			if (opts.seccomp_filter)
 				errx(EXIT_FAILURE,
@@ -1062,6 +1126,30 @@ int main(int argc, char **argv)
 			errx(EXIT_FAILURE,
 			     _("--list-caps must be specified alone"));
 		list_known_caps();
+		return EXIT_SUCCESS;
+	}
+
+	if (landlock_support) {
+		if (total_opts != 1 || optind < argc)
+			errx(EXIT_FAILURE,
+			     _("--landlock-support must be specified alone"));
+		list_landlock_support();
+		return EXIT_SUCCESS;
+	}
+
+	if (landlock_list_access) {
+		if (total_opts != 1 || optind < argc)
+			errx(EXIT_FAILURE,
+			     _("--list-landlock-access must be specified alone"));
+		list_landlock_access();
+		return EXIT_SUCCESS;
+	}
+
+	if (landlock_list_rights_access) {
+		if (total_opts != 1 || optind < argc)
+			errx(EXIT_FAILURE,
+			     _("--list-landlock-rights must be specified alone"));
+		list_landlock_rights(landlock_list_rights_access);
 		return EXIT_SUCCESS;
 	}
 

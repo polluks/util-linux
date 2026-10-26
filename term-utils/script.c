@@ -499,7 +499,7 @@ static ssize_t log_write(struct script_control *ctl,
 	switch (log->format) {
 	case SCRIPT_FMT_RAW:
 		DBG(IO, ul_debug("  log raw data"));
-		rc = fwrite_all(obuf, 1, bytes, log->fp);
+		rc = ul_fwrite_all(obuf, 1, bytes, log->fp);
 		if (rc) {
 			warn(_("cannot write %s"), log->filename);
 			return rc;
@@ -1027,6 +1027,8 @@ int main(int argc, char **argv)
 
 	if (ul_pty_signals_setup(ctl.pty))
 		err(EXIT_FAILURE, _("failed to initialize signals handler"));
+	if (ul_pty_terminal_setup(ctl.pty))
+		err(EXIT_FAILURE, _("failed to setup terminal"));
 	fflush(stdout);
 
 	/*

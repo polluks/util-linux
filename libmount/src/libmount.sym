@@ -421,3 +421,13 @@ MOUNT_2_42 {
 	mnt_fs_is_attached;
 	mnt_fs_is_detached;
 } MOUNT_2_41;
+
+MOUNT_2_43 {
+	mnt_cache_refer_vfs;
+	mnt_config_get_value;
+	mnt_context_set_restricted;
+	mnt_context_set_vfs;
+	mnt_table_disable_useropts;
+	mnt_table_parse_utab;
+	mnt_table_refer_vfs;
+} MOUNT_2_42;

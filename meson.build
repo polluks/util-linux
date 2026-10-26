@@ -118,7 +118,6 @@ headers = '''
         linux/fiemap.h
         linux/gsmmux.h
         linux/if_alg.h
-        linux/landlock.h
         linux/lp.h
         linux/kcmp.h
         linux/net_namespace.h
@@ -209,6 +208,10 @@ login_stat_mail = get_option('login-stat-mail')
 conf.set('LOGIN_STAT_MAIL', login_stat_mail ? 1 : false)
 summary('login-stat-mail', login_stat_mail ? 'enabled' : 'disabled', section : 'components')
 
+login_chown_vcs = get_option('login-chown-vcs')
+conf.set('LOGIN_CHOWN_VCS', login_chown_vcs ? 1 : false)
+summary('login-chown-vcs', login_chown_vcs ? 'enabled' : 'disabled', section : 'components')
+
 have = cc.has_type('struct fanotify_event_info_header', prefix : '#include <linux/fanotify.h>')
 conf.set('HAVE_STRUCT_FANOTIFY_EVENT_INFO_HEADER', have ? 1 : false)
 
@@ -216,11 +219,17 @@ have_mountfd_api = cc.has_type('struct mount_attr', prefix : '#include <linux/mo
 conf.set('HAVE_STRUCT_MOUNT_ATTR', have_mountfd_api ? 1 : false)
 conf.set('HAVE_MOUNTFD_API', have_mountfd_api ? 1 : false)
 
-have_struct_statx = cc.has_type('struct statx', args : '-D_GNU_SOURCE', prefix : '#include <sys/stat.h>')
+have_struct_statx = false
+have_statx_mnt_id = false
+if host_machine.system() == 'linux'
+  have_struct_statx = cc.has_type('struct statx', args : '-D_GNU_SOURCE', prefix : '#include <sys/stat.h>')
+  if have_struct_statx
+    have_statx_mnt_id = cc.has_member('struct statx', 'stx_mnt_id',
+                                       prefix : '#include <sys/stat.h>')
+  endif
+endif
 conf.set('HAVE_STRUCT_STATX', have_struct_statx ? 1 : false)
-have = cc.has_member('struct statx', 'stx_mnt_id',
-                     prefix : '#include <sys/stat.h>')
-conf.set('HAVE_STRUCT_STATX_STX_MNT_ID', have ? 1 : false)
+conf.set('HAVE_STRUCT_STATX_STX_MNT_ID', have_statx_mnt_id ? 1 : false)
 
 
 have_statmount = cc.has_type('struct statmount', prefix : '#include <linux/mount.h>')
@@ -235,6 +244,11 @@ if have_listmount and not cc.has_header_symbol('bits/syscall.h', 'SYS_listmount'
 endif
 
 conf.set('HAVE_STATMOUNT_API', have_statmount and have_listmount ? 1 : false)
+
+have_landlock = cc.has_header_symbol('sys/syscall.h', '__NR_landlock_create_ruleset') \
+            and cc.has_header_symbol('sys/syscall.h', '__NR_landlock_add_rule') \
+            and cc.has_header_symbol('sys/syscall.h', '__NR_landlock_restrict_self')
+conf.set('HAVE_LANDLOCK', have_landlock ? 1 : false)
 
 
 have_sys_vfs_header = cc.has_header('sys/vfs.h')
@@ -294,6 +308,15 @@ if get_option('ncurses').enabled() and get_option('widechar').enabled()
   error('widechar support is incompatible with non-wide ncurses')
 endif
 conf.set('HAVE_WIDECHAR', have ? 1 : false)
+
+# The "R" (SHF_GNU_RETAIN) section flag is only understood by binutils >= 2.36.
+if cc.compiles(
+        '__asm__(".pushsection .note.test, \\"aR\\", %note\\n.popsection\\n");',
+        name : 'assembler supports the "R" (SHF_GNU_RETAIN) section flag')
+        conf.set_quoted('_UL_ELF_NOTE_DLOPEN_SECTION_FLAGS', 'aGR')
+else
+        conf.set_quoted('_UL_ELF_NOTE_DLOPEN_SECTION_FLAGS', 'aG')
+endif
 
 lib_m = cc.find_library('m')
 
@@ -382,6 +405,12 @@ lib_utempter = cc.find_library(
   required : get_option('libutempter'))
 conf.set('HAVE_LIBUTEMPTER', lib_utempter.found() ? 1 : false)
 
+if meson.version().version_compare('>= 0.62.0')
+  lib_dl = dependency('dl')
+else
+  lib_dl = cc.find_library('dl')
+endif
+
 systemd = dependency(
   'systemd',
   required : get_option('systemd'))
@@ -396,7 +425,25 @@ lib_systemd = dependency(
   required : get_option('systemd'))
 conf.set('HAVE_LIBSYSTEMD', lib_systemd.found() ? 1 : false)
 conf.set('USE_SYSTEMD', lib_systemd.found() ? 1 : false)
-summary('libsystemd', lib_systemd.found() ? 'enabled' : 'disabled', section : 'components')
+use_dlopen_systemd = get_option('systemd-dlopen') and lib_systemd.found()
+conf.set('USE_DLOPEN_SYSTEMD', use_dlopen_systemd ? 1 : false)
+
+summary('libsystemd',
+        lib_systemd.found() ? 'enabled' : 'disabled',
+        section : 'components')
+summary('systemd dlopen',
+        use_dlopen_systemd ? 'enabled' : 'disabled',
+        section : 'components')
+
+systemd_deps = []
+if lib_systemd.found()
+  if use_dlopen_systemd
+    systemd_deps = [lib_systemd.partial_dependency(compile_args : true, includes : true),
+                    lib_dl]
+  else
+    systemd_deps = [lib_systemd]
+  endif
+endif
 
 # Since systemd-240, which provides basic functions in sd-device.
 have = cc.has_function(
@@ -458,28 +505,30 @@ lib_cryptsetup = dependency(
   'libcryptsetup',
   required : get_option('cryptsetup'))
 conf.set('HAVE_CRYPTSETUP', lib_cryptsetup.found() ? 1 : false)
+use_dlopen_cryptsetup = get_option('cryptsetup-dlopen') and lib_cryptsetup.found()
+conf.set('USE_DLOPEN_CRYPTSETUP', use_dlopen_cryptsetup ? 1 : false)
 
-cryptsetup_dlopen = get_option('cryptsetup').allowed() and get_option('cryptsetup-dlopen').enabled()
-if cryptsetup_dlopen
-  if meson.version().version_compare('>= 0.62.0')
-    lib_dl = dependency('dl')
-  else
-    lib_dl = cc.find_library('dl')
-  endif
-  conf.set('CRYPTSETUP_VIA_DLOPEN', 1)
-  summary('cryptsetup support (dlopen)',
-          'enabled',
-          section : 'components')
-else
-  summary('cryptsetup support',
-          lib_cryptsetup.found()  ? 'enabled' : 'disabled',
-          section : 'components')
-endif
+summary('cryptsetup support',
+        lib_cryptsetup.found() ? 'enabled' : 'disabled',
+        section : 'components')
+summary('cryptsetup dlopen',
+        use_dlopen_cryptsetup ? 'enabled' : 'disabled',
+        section : 'components')
 
 have = cc.has_function(
   'crypt_activate_by_signed_key',
   dependencies : lib_cryptsetup)
 conf.set('HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY', have ? 1 : false)
+
+cryptsetup_deps = []
+if lib_cryptsetup.found()
+  if use_dlopen_cryptsetup
+    cryptsetup_deps = [lib_cryptsetup.partial_dependency(compile_args : true, includes : true),
+                       lib_dl]
+  else
+    cryptsetup_deps = [lib_cryptsetup]
+  endif
+endif
 
 lib_cap_ng = dependency(
   'libcap-ng',
@@ -493,10 +542,27 @@ lib_selinux = dependency(
   version : '>= 2.5',
   required : get_option('selinux'))
 conf.set('HAVE_LIBSELINUX', lib_selinux.found() ? 1 : false)
+use_dlopen_selinux = get_option('selinux-dlopen') and lib_selinux.found()
+conf.set('USE_DLOPEN_SELINUX', use_dlopen_selinux ? 1 : false)
+
+summary('SELinux support',
+        lib_selinux.found() ? 'enabled' : 'disabled',
+        section : 'components')
+summary('SELinux dlopen',
+        use_dlopen_selinux ? 'enabled' : 'disabled',
+        section : 'components')
+
+selinux_deps = []
 if lib_selinux.found()
   have = cc.has_function('security_get_initial_context',
                          dependencies : lib_selinux)
   conf.set('HAVE_SECURITY_GET_INITIAL_CONTEXT', have ? 1 : false)
+  if use_dlopen_selinux
+    selinux_deps = [lib_selinux.partial_dependency(compile_args : true, includes : true),
+                    lib_dl]
+  else
+    selinux_deps = [lib_selinux]
+  endif
 endif
 
 lib_magic = dependency(
@@ -508,16 +574,45 @@ lib_econf = dependency(
   'libeconf',
   required : get_option('econf'))
 conf.set('HAVE_LIBECONF', lib_econf.found() ? 1 : false)
+use_dlopen_econf = get_option('econf-dlopen') and lib_econf.found()
+conf.set('USE_DLOPEN_ECONF', use_dlopen_econf ? 1 : false)
+
+summary('libeconf',
+        lib_econf.found() ? 'enabled' : 'disabled',
+        section : 'components')
+summary('econf dlopen',
+        use_dlopen_econf ? 'enabled' : 'disabled',
+        section : 'components')
 
 have = cc.has_function(
   'econf_readConfig',
   dependencies : lib_econf)
 conf.set('HAVE_ECONF_READCONFIG', have ? 1 : false)
 
+econf_deps = []
+if lib_econf.found()
+  if use_dlopen_econf
+    econf_deps = [lib_econf.partial_dependency(compile_args : true, includes : true),
+                  lib_dl]
+  else
+    econf_deps = [lib_econf]
+  endif
+endif
+
 lib_audit = dependency(
   'audit',
   required : get_option('audit'))
 conf.set('HAVE_LIBAUDIT', lib_audit.found() ? 1 : false)
+
+lib_fuse = dependency(
+  'fuse',
+  version : '>= 2.6',
+  required : get_option('fuse'))
+conf.set('HAVE_LIBFUSE', lib_fuse.found() ? 1 : false)
+
+summary('libfuse',
+        lib_fuse.found() ? 'enabled' : 'disabled',
+        section : 'components')
 
 conf.set('HAVE_SMACK', get_option('smack').allowed())
 
@@ -638,6 +733,7 @@ funcs = '''
         errx
         explicit_bzero
         fallocate
+        fchmodat2
         fnmatch
         fseeko
         fsconfig
@@ -657,9 +753,6 @@ funcs = '''
         getsgnam
         inotify_init
         jrand48
-        landlock_create_ruleset
-        landlock_add_rule
-        landlock_restrict_self
         lchown
         lgetxattr
         llistxattr
@@ -692,7 +785,6 @@ funcs = '''
         sched_setscheduler
         sigqueue
         srandom
-        statx
         strnchr
         strndup
         strnlen
@@ -731,6 +823,12 @@ foreach func: funcs
   # redefined macros from Python.h, which uses this convention.
   conf.set('HAVE_' + func.to_upper(), have ? 1 : false)
 endforeach
+
+have_statx = false
+if host_machine.system() == 'linux'
+  have_statx = cc.has_function('statx')
+endif
+conf.set('HAVE_STATX', have_statx ? 1 : false)
 
 # scandirat() may exist in the SDK but be gated behind availability
 # annotations (e.g. macOS); verify it is actually usable at compile time.
@@ -960,11 +1058,6 @@ if fs_search_path_extra != ''
 endif
 conf.set_quoted('FS_SEARCH_PATH', fs_search_path)
 
-ntfs_mounttype = get_option('ntfs-mounttype')
-if ntfs_mounttype != ''
-  conf.set_quoted('CONFIG_UL_NTFS_MOUNTTYPE', ntfs_mounttype)
-endif
-
 systemdsystemunitdir = ''
 if systemd.found()
   systemdsystemunitdir = systemd.get_variable(pkgconfig : 'systemdsystemunitdir')
@@ -1058,6 +1151,17 @@ bashcompletionslinks = {}
 
 subdir('include')
 subdir('lib')
+
+if use_dlopen_selinux or use_dlopen_cryptsetup or use_dlopen_systemd or use_dlopen_econf
+  common_dl_sources = [dl_utils_c]
+else
+  common_dl_sources = []
+endif
+selinux_sources = use_dlopen_selinux ? [dl_selinux_c] : []
+cryptsetup_sources = use_dlopen_cryptsetup ? [dl_cryptsetup_c] : []
+systemd_sources = use_dlopen_systemd ? [dl_systemd_c] : []
+econf_sources = use_dlopen_econf ? [dl_econf_c] : []
+
 subdir('libblkid')
 subdir('libmount')
 subdir('libsmartcols')
@@ -1093,7 +1197,7 @@ exe = executable(
   chfn_sources,
   chfn_chsh_sources,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs],
+  link_with : [lib_common],
   dependencies : chfn_chsh_deps,
   install_dir : usrbin_exec_dir,
   install_mode : 'rwsr-xr-x',
@@ -1103,9 +1207,10 @@ exe = executable(
 exe2 = executable(
   'chsh',
   'login-utils/chsh.c',
+  shells_c,
   chfn_chsh_sources,
   include_directories : includes,
-  link_with : [lib_common, lib_common_shells],
+  link_with : [lib_common],
   dependencies : chfn_chsh_deps,
   install_dir : usrbin_exec_dir,
   install_mode : 'rwsr-xr-x',
@@ -1193,14 +1298,17 @@ exe = executable(
   'login-utils/su.c',
   'login-utils/su-common.c',
   'login-utils/su-common.h',
+  logindefs_c,
+  shells_c,
+  econf_sources, common_dl_sources,
   pty_session_c,
   monotonic_c,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs, lib_common_shells],
+  link_with : [lib_common],
   dependencies : [lib_pam,
                   lib_pam_misc,
                   lib_util,
-                  realtime_libs],
+                  realtime_libs] + econf_deps,
   install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
@@ -1233,13 +1341,13 @@ opt = get_option('build-lslogins') \
 exe = executable(
   'lslogins',
   'login-utils/lslogins.c',
+  logindefs_c,
+  selinux_sources, systemd_sources, econf_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_smartcols,
-               lib_common_logindefs] +
+               lib_smartcols] +
                (build_liblastlog2 ? [lib_lastlog2] : []),
-  dependencies : [lib_selinux,
-                  lib_systemd],
+  dependencies : systemd_deps + selinux_deps + econf_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -1256,9 +1364,10 @@ exe = executable(
   'vipw',
   'login-utils/vipw.c',
   'login-utils/setpwnam.h',
+  selinux_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_selinux],
+  dependencies : selinux_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -1279,14 +1388,17 @@ exe = executable(
   'login-utils/runuser.c',
   'login-utils/su-common.c',
   'login-utils/su-common.h',
+  logindefs_c,
+  shells_c,
+  econf_sources, common_dl_sources,
   pty_session_c,
   monotonic_c,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs, lib_common_shells],
+  link_with : [lib_common],
   dependencies : [lib_pam,
                   lib_pam_misc,
                   lib_util,
-                  realtime_libs],
+                  realtime_libs] + econf_deps,
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -1453,7 +1565,6 @@ exe2 = executable(
   dependencies : [curses_libs,
 		  lib_magic],
   build_by_default : opt and program_tests)
-exes += exe
 if opt and not is_disabler(exe)
   exes += [exe, exe2]
   manadocs += more_manadocs
@@ -1924,11 +2035,11 @@ opt = get_option('build-zramctl').allowed()
 exe = executable(
   'zramctl',
   zramctl_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common,
                lib_smartcols],
-  # requires systemd v240 or newer
-  dependencies : [conf.get('HAVE_DECL_SD_DEVICE_NEW_FROM_SYSPATH').to_string() == '1' ? lib_systemd : [] ],
+  dependencies : systemd_deps,
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -1977,10 +2088,11 @@ opt = get_option('build-mount').allowed()
 exe = executable(
   'mount',
   mount_sources,
+  selinux_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common,
                lib_smartcols],
-  dependencies : [lib_selinux, mount_dep],
+  dependencies : [mount_dep] + selinux_deps,
   install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
@@ -2218,9 +2330,10 @@ opt = get_option('build-nsenter') \
 exe = executable(
   'nsenter',
   nsenter_sources,
+  selinux_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_selinux],
+  dependencies : selinux_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -2234,9 +2347,10 @@ opt = opt and 'nsenter' in static_programs
 exe = executable(
   'nsenter.static',
   nsenter_sources,
+  selinux_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_selinux],
+  dependencies : selinux_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -2250,9 +2364,11 @@ opt = get_option('build-setpriv').allowed() \
 exe = executable(
   'setpriv',
   setpriv_sources,
+  logindefs_c,
+  econf_sources, common_dl_sources,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs],
-  dependencies : [lib_cap_ng],
+  link_with : [lib_common],
+  dependencies : [lib_cap_ng] + econf_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -2403,7 +2519,7 @@ exe = executable(
   include_directories : includes,
   link_with : [lib_common,
                lib_uuid],
-  dependencies: [blkid_dep, lib_selinux],
+  dependencies: [blkid_dep] + selinux_deps,
   install_dir : sbindir,
   install : true)
 if not is_disabler(exe)
@@ -2812,9 +2928,11 @@ opt = get_option('build-agetty') \
 exe = executable(
   'agetty',
   agetty_sources,
+  logindefs_c,
+  systemd_sources, econf_sources, common_dl_sources,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs],
-  dependencies : [BSD ? lib_util : [], lib_systemd],
+  link_with : [lib_common],
+  dependencies : [BSD ? lib_util : []] + systemd_deps + econf_deps,
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -2867,9 +2985,10 @@ opt = get_option('build-wall').allowed()
 exe = executable(
   'wall',
   wall_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_systemd],
+  dependencies : systemd_deps,
   install_dir : usrbin_exec_dir,
   install_mode : tty_install_mode,
   install : opt,
@@ -2889,9 +3008,10 @@ opt = get_option('build-write') \
 exe = executable(
   'write',
   write_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_systemd],
+  dependencies : systemd_deps,
   install_dir : usrbin_exec_dir,
   install_mode : tty_install_mode,
   install : opt,
@@ -2909,11 +3029,13 @@ opt = get_option('build-login').allowed()
 exe = executable(
   'login',
   login_sources,
+  logindefs_c,
+  shells_c,
+  econf_sources, common_dl_sources,
   include_directories : includes,
-  link_with : [lib_common, lib_common_logindefs, lib_common_shells],
+  link_with : [lib_common],
   dependencies : [lib_pam,
-                  lib_audit,
-                  lib_selinux],
+                  lib_audit] + econf_deps,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
@@ -2927,10 +3049,10 @@ opt = get_option('build-sulogin') \
 exe = executable(
   'sulogin',
   sulogin_sources,
+  selinux_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_crypt,
-                  lib_selinux],
+  dependencies : [lib_crypt] + selinux_deps,
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -2960,9 +3082,10 @@ opt = get_option('build-logger').allowed()
 exe = executable(
   'logger',
   logger_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_systemd],
+  dependencies : systemd_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -2975,10 +3098,11 @@ endif
 exe = executable(
   'test_logger',
   logger_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   c_args : '-DTEST_LOGGER',
   link_with : [lib_common],
-  dependencies : [lib_systemd],
+  dependencies : systemd_deps,
   build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
@@ -3031,8 +3155,9 @@ opt = get_option('build-namei').allowed()
 exe = executable(
   'namei',
   namei_sources,
+  selinux_sources, common_dl_sources,
   include_directories : includes,
-  dependencies : [lib_selinux],
+  dependencies : selinux_deps,
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -3150,11 +3275,11 @@ opt = build_uuidd
 exe = executable(
   'uuidd',
   uuidd_sources,
+  systemd_sources, common_dl_sources,
   include_directories : includes,
   link_with : [lib_common,
                lib_uuid],
-  dependencies : [realtime_libs,
-                  lib_systemd],
+  dependencies : [realtime_libs] + systemd_deps,
   install_dir : usrsbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -3166,7 +3291,7 @@ exe2 = executable(
                lib_uuid],
   dependencies : thread_libs,
   build_by_default : opt and program_tests)
-if not is_disabler(exe)
+if opt and not is_disabler(exe)
   exes += [exe, exe2]
   manadocs += uuidd_manadocs
   bashcompletions += ['uuidd']
@@ -3818,9 +3943,11 @@ endif
 exe = executable(
   'test_logindefs',
   'lib/logindefs.c',
+  econf_sources, common_dl_sources,
   c_args : ['-DTEST_PROGRAM'],
   include_directories : dir_include,
-  link_with : [lib_common, lib_common_logindefs],
+  link_with : lib_common,
+  dependencies : econf_deps,
   build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
@@ -4075,14 +4202,37 @@ if not is_disabler(exe)
   exes += exe
 endif
 
-if LINUX and lib_rt.found()
-  exe = executable(
-    'test_mkfds',
+if LINUX
+  test_mkfds_c_args = []
+  test_mkfds_deps = []
+  test_mkfds_sources = [
     'tests/helpers/test_mkfds.c',
     'tests/helpers/test_mkfds.h',
     'tests/helpers/test_mkfds_ppoll.c',
+  ]
+  if lib_rt.found()
+    test_mkfds_deps += [lib_rt]
+  endif
+  if cc.has_header_symbol('linux/bpf.h', 'BPF_LINK_CREATE')
+    test_mkfds_c_args += ['-DHAVE_BPF_LINK_CREATE']
+  endif
+  if cc.has_header_symbol('linux/bpf.h', 'BPF_F_MMAPABLE')
+    test_mkfds_c_args += ['-DHAVE_BPF_F_MMAPABLE']
+  endif
+  if cc.has_header('linux/io_uring.h')
+    test_mkfds_c_args += ['-DHAVE_LINUX_IO_URING_H']
+  endif
+  if lib_fuse.found()
+    test_mkfds_sources += ['tests/helpers/test_mkfds_hungfs.c']
+    test_mkfds_deps += [lib_fuse]
+  endif
+  exe = executable(
+    'test_mkfds',
+    test_mkfds_sources,
     include_directories : includes,
-    dependencies : [lib_rt],
+    link_with : lib_smartcols.get_static_lib(),
+    dependencies : test_mkfds_deps,
+    c_args : test_mkfds_c_args,
     build_by_default: program_tests)
   exes += exe
 endif
@@ -4093,7 +4243,9 @@ exe = executable(
   'tests/helpers/test_enosys.c',
   include_directories : includes,
   build_by_default: opt and program_tests)
-exes += exe
+if opt and not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_open_twice',

@@ -682,6 +682,8 @@ static int execute(const char *progname, const char *progpath,
 		pid = -1;
 	else if ((pid = fork()) < 0) {
 		warn(_("fork failed"));
+		for (i = 0; i < argc; i++)
+			free(argv[i]);
 		free_instance(inst);
 		return errno;
 	} else if (pid == 0) {
@@ -953,6 +955,17 @@ static struct fs_type_compile {
 #define FS_TYPE_NORMAL	0
 #define FS_TYPE_OPT	1
 #define FS_TYPE_NEGOPT	2
+
+static void free_fs_type_compile(struct fs_type_compile *cmp)
+{
+	if (cmp->list) {
+		size_t i;
+		for (i = 0; cmp->list[i]; i++)
+			free(cmp->list[i]);
+		free(cmp->list);
+	}
+	free(cmp->type);
+}
 
 static void compile_fs_type(char *fs_type, struct fs_type_compile *cmp)
 {
@@ -1706,5 +1719,6 @@ int main(int argc, char *argv[])
 	mnt_unref_cache(mntcache);
 	mnt_unref_table(fstab);
 	mnt_unref_table(mtab);
+	free_fs_type_compile(&fs_type_compiled);
 	return status;
 }

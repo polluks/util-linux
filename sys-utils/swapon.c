@@ -397,7 +397,7 @@ static int swap_rewrite_signature(const struct swap_device *dev)
 	assert(dev->path);
 	assert(dev->pagesize);
 
-	fd = open(dev->path, O_WRONLY);
+	fd = open(dev->path, O_WRONLY | O_CLOEXEC);
 	if (fd == -1) {
 		warn(_("cannot open %s"), dev->path);
 		return -1;
@@ -533,14 +533,14 @@ static int swapon_checks(const struct swapon_ctl *ctl, struct swap_device *dev)
 	struct stat st;
 	int fd, sig;
 	char *hdr = NULL;
-	unsigned long long devsize = 0;
+	uint64_t devsize = 0;
 	int permMask;
 
 	assert(ctl);
 	assert(dev);
 	assert(dev->path);
 
-	fd = open(dev->path, O_RDONLY);
+	fd = open(dev->path, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		warn(_("cannot open %s"), dev->path);
 		goto err;
@@ -568,7 +568,7 @@ static int swapon_checks(const struct swapon_ctl *ctl, struct swap_device *dev)
 				dev->path);
 			goto err;
 		}
-		devsize = st.st_size;
+		devsize = (uint64_t) st.st_size;
 	}
 
 	if (S_ISBLK(st.st_mode) && blkdev_get_size(fd, &devsize)) {
@@ -594,8 +594,9 @@ static int swapon_checks(const struct swapon_ctl *ctl, struct swap_device *dev)
 		int syspg = getpagesize();
 
 		if (ctl->verbose)
-			warnx(_("%s: pagesize=%u, swapsize=%llu, devsize=%llu"),
-				dev->path, dev->pagesize, swapsize, devsize);
+			warnx(_("%s: pagesize=%u, swapsize=%ju, devsize=%ju"),
+				dev->path, dev->pagesize,
+				(uintmax_t) swapsize, (uintmax_t) devsize);
 
 		if (swapsize > devsize) {
 			if (ctl->verbose)

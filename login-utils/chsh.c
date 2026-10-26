@@ -47,7 +47,7 @@
 #include "shells.h"
 
 #ifdef HAVE_LIBSELINUX
-# include <selinux/selinux.h>
+# include "dl-selinux.h"
 # include "selinux-utils.h"
 #endif
 
@@ -103,7 +103,22 @@ static void parse_argv(int argc, char **argv, struct sinfo *pinfo)
 		switch (c) {
 		case 'v': /* deprecated */
 		case 'V':
-			print_version(EXIT_SUCCESS);
+		{
+			static const char *const features[] = {
+#ifdef HAVE_LIBSELINUX
+# ifdef USE_DLOPEN_SELINUX
+				"selinux(dlopen)",
+# else
+				"selinux",
+# endif
+#endif
+#ifdef HAVE_LIBUSER
+				"libuser",
+#endif
+				NULL
+			};
+			print_version_with_features(EXIT_SUCCESS, features);
+		}
 		case 'u': /* deprecated */
 		case 'h':
 			usage();
@@ -219,7 +234,7 @@ int main(int argc, char **argv)
 #endif
 
 #ifdef HAVE_LIBSELINUX
-	if (is_selinux_enabled() > 0) {
+	if (ul_dlopen_libselinux() == 0 && selinux_call(is_selinux_enabled)() > 0) {
 		char *user_cxt = NULL;
 
 		if (uid == 0 && !ul_selinux_has_access("passwd", "chsh", &user_cxt))

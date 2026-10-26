@@ -45,6 +45,24 @@ ts_init_subtest "pseudo"
 $TS_CMD_FINDMNT --pseudo --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
 ts_finalize_subtest
 
+ts_init_subtest "net"
+$TS_CMD_FINDMNT --net --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+ts_finalize_subtest
+
+ts_init_subtest "local"
+$TS_CMD_FINDMNT --local --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+ts_finalize_subtest
+
+ts_init_subtest "real-local"
+$TS_CMD_FINDMNT --real --local --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+ts_finalize_subtest
+
+ts_init_subtest "net-local"
+# expected fail (mutually exclusive)
+$TS_CMD_FINDMNT --net --local --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>&1
+echo "rc=$?" >>"$TS_OUTPUT"
+ts_finalize_subtest
+
 ts_init_subtest "invert-pseudo"
 $TS_CMD_FINDMNT --invert --pseudo --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
 ts_finalize_subtest
@@ -110,6 +128,12 @@ ts_init_subtest "hyperlink"
 $TS_CMD_FINDMNT --all --noheadings --hyperlink=always --tab-file "$TS_SELF/files/mountinfo" >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
 osc8_start_sequence="$($TS_CMD_HEXDUMP --no-squeezing --length 5 --format '"%_c"' "$TS_OUTPUT" 2>>"$TS_ERRLOG")"
 echo "$osc8_start_sequence" >"$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "shell"
+$TS_CMD_FINDMNT --shell --raw --output-all >"$TS_ERRLOG"
+head -n1 "$TS_ERRLOG" >"$TS_OUTPUT"
+true >"$TS_ERRLOG"
 ts_finalize_subtest
 
 ts_init_subtest "canonicalization"

@@ -81,6 +81,7 @@ libblkid_la_SOURCES = \
 	libblkid/src/superblocks/refs.c \
 	libblkid/src/superblocks/nvidia_raid.c \
 	libblkid/src/superblocks/ocfs.c \
+	libblkid/src/superblocks/opensvc_hb.c \
 	libblkid/src/superblocks/promise_raid.c \
 	libblkid/src/superblocks/reiserfs.c \
 	libblkid/src/superblocks/romfs.c \
@@ -121,7 +122,13 @@ endif
 
 libblkid_la_LIBADD = libcommon.la
 if HAVE_ECONF
+libblkid_la_SOURCES += $(econf_sources)
+if USE_DLOPEN_ECONF
+libblkid_la_SOURCES += $(common_dl_sources)
+libblkid_la_LIBADD += $(common_dl_ldadd)
+else
 libblkid_la_LIBADD += $(ECONF_LIBS)
+endif
 endif
 
 EXTRA_libblkid_la_DEPENDENCIES = \
@@ -130,6 +137,7 @@ EXTRA_libblkid_la_DEPENDENCIES = \
 libblkid_la_CFLAGS = \
 	$(AM_CFLAGS) \
 	$(SOLIB_CFLAGS) \
+	$(ECONF_CFLAGS) \
 	-I$(ul_libblkid_incdir) \
 	-I$(top_srcdir)/libblkid/src
 

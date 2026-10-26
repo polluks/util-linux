@@ -23,7 +23,11 @@
 static const char *lib_version = LIBMOUNT_VERSION;
 static const char *lib_features[] = {
 #ifdef HAVE_LIBSELINUX
+# ifdef USE_DLOPEN_SELINUX
+	"selinux(dlopen)",
+# else
 	"selinux",
+# endif
 #endif
 #ifdef HAVE_SMACK
 	"smack",
@@ -32,12 +36,16 @@ static const char *lib_features[] = {
 	"btrfs",
 #endif
 #ifdef HAVE_CRYPTSETUP
+# ifdef USE_DLOPEN_CRYPTSETUP
+	"verity(dlopen)",
+# else
 	"verity",
+# endif
 #endif
 #ifdef USE_LIBMOUNT_SUPPORT_NAMESPACES
 	"namespaces",
 #endif
-#if defined(HAVE_MOUNTFD_API) && defined(HAVE_LINUX_MOUNT_H)
+#ifdef USE_LIBMOUNT_MOUNTFD_SUPPORT
 	"idmapping",
 #endif
 #ifdef USE_LIBMOUNT_MOUNTFD_SUPPORT

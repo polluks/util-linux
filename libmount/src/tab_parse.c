@@ -844,7 +844,7 @@ int mnt_table_parse_file(struct libmnt_table *tb, const char *filename)
 	if (!filename || !tb)
 		return -EINVAL;
 
-	f = fopen(filename, "r" UL_CLOEXECSTR);
+	f = ul_vfs_fopen(tb->vfs, filename, "r" UL_CLOEXECSTR);
 	if (f) {
 		rc = mnt_table_parse_stream(tb, f, filename);
 		fclose(f);
@@ -1082,12 +1082,16 @@ int mnt_table_set_parser_fltrcb(struct libmnt_table *tb,
 	return 0;
 }
 
-/*
+/**
  * mnt_table_enable_noautofs:
  * @tb: table
  * @ignore: ignore or don't ignore
  *
  * Enable/disable ignore autofs mount table entries on reading.
+ *
+ * Returns: 0 on success or negative number in case of error.
+ *
+ * Since: 2.38
  */
 int mnt_table_enable_noautofs(struct libmnt_table *tb, int ignore)
 {
@@ -1097,15 +1101,38 @@ int mnt_table_enable_noautofs(struct libmnt_table *tb, int ignore)
 	return 0;
 }
 
-/*
+/**
  * mnt_table_is_noautofs:
  * @tb: table
  *
- * Return the the enabled status of ignore autofs mount table entries.
+ * Returns: 1 if autofs entries are ignored, 0 otherwise.
+ *
+ * Since: 2.38
  */
 int mnt_table_is_noautofs(struct libmnt_table *tb)
 {
 	return tb ? tb->noautofs : 0;
+}
+
+/**
+ * mnt_table_disable_useropts:
+ * @tb: table
+ * @disable: 1 to disable, 0 to enable
+ *
+ * Disable or enable merging of userspace mount options from utab when
+ * populating the mount table. This applies to both mountinfo and
+ * listmount-based table sources.
+ *
+ * Returns: 0 on success, <0 on error.
+ *
+ * Since: 2.43
+ */
+int mnt_table_disable_useropts(struct libmnt_table *tb, int disable)
+{
+	if (!tb)
+		return -EINVAL;
+	tb->nouseropts = disable ? 1 : 0;
+	return 0;
 }
 
 /**
@@ -1130,6 +1157,34 @@ int mnt_table_parse_swaps(struct libmnt_table *tb, const char *filename)
 	}
 
 	tb->fmt = MNT_FMT_SWAPS;
+
+	return mnt_table_parse_file(tb, filename);
+}
+
+/**
+ * mnt_table_parse_utab:
+ * @tb: table
+ * @filename: overwrites default or NULL (recommended)
+ *
+ * This function parses the utab file and appends new lines to the @tb. The utab
+ * is a private libmount file that stores userspace mount options. The file
+ * location and format are library implementation details and subject to change;
+ * use NULL as @filename to let the library determine the correct path.
+ *
+ * Returns: 0 on success or negative number in case of error.
+ *
+ * Since: 2.43
+ */
+int mnt_table_parse_utab(struct libmnt_table *tb, const char *filename)
+{
+	if (!tb)
+		return -EINVAL;
+	if (!filename)
+		filename = mnt_get_utab_path();
+	if (!filename || is_file_empty(filename))
+		return 0;
+
+	tb->fmt = MNT_FMT_UTAB;
 
 	return mnt_table_parse_file(tb, filename);
 }
@@ -1231,7 +1286,9 @@ static struct libmnt_fs *mnt_table_merge_user_fs(struct libmnt_table *tb, struct
 
 	if (fs) {
 		DBG_OBJ(TAB, tb, ul_debug(" found"));
-		mnt_fs_append_options(fs, optstr);
+		mnt_optstr_append_option(&fs->user_optstr, optstr, NULL);
+		free(fs->optstr);
+		fs->optstr = NULL;
 		mnt_fs_append_attributes(fs, attrs);
 		mnt_fs_set_bindsrc(fs, mnt_fs_get_bindsrc(uf));
 		fs->flags |= MNT_FS_MERGED;
@@ -1241,12 +1298,62 @@ static struct libmnt_fs *mnt_table_merge_user_fs(struct libmnt_table *tb, struct
 	return fs;
 }
 
+/*
+ * Read utab and merge userspace options into the mount table @tb.
+ * If @u_tb is provided, use it as utab; otherwise read from
+ * /run/mount/utab.
+ */
+int mnt_table_merge_utab(struct libmnt_table *tb, struct libmnt_table *u_tb)
+{
+	int rc = 0, priv_utab = 0;
+
+	assert(tb);
+
+	if (tb->nouseropts)
+		return 0;
+	if (mnt_table_get_nents(tb) == 0)
+		return 0;
+
+	if (!u_tb) {
+		const char *utab = mnt_get_utab_path();
+
+		if (!utab || is_file_empty(utab))
+			return 0;
+
+		u_tb = mnt_new_table();
+		if (!u_tb)
+			return -ENOMEM;
+
+		u_tb->fmt = MNT_FMT_UTAB;
+		mnt_table_set_parser_fltrcb(u_tb, tb->fltrcb, tb->fltrcb_data);
+
+		rc = mnt_table_parse_file(u_tb, utab);
+		priv_utab = 1;
+	}
+
+	DBG_OBJ(TAB, tb, ul_debug("merging utab"));
+
+	if (rc == 0) {
+		struct libmnt_fs *u_fs;
+		struct libmnt_iter itr;
+
+		mnt_reset_iter(&itr, MNT_ITER_BACKWARD);
+
+		while (mnt_table_next_fs(u_tb, &itr, &u_fs) == 0)
+			mnt_table_merge_user_fs(tb, u_fs);
+	}
+
+	if (priv_utab)
+		mnt_unref_table(u_tb);
+	return 0;
+}
+
 /* default filename is /proc/self/mountinfo
  */
 int __mnt_table_parse_mountinfo(struct libmnt_table *tb, const char *filename,
 			   struct libmnt_table *u_tb)
 {
-	int rc = 0, priv_utab = 0;
+	int rc = 0;
 	int explicit_file = filename ? 1 : 0;
 
 	assert(tb);
@@ -1273,48 +1380,11 @@ int __mnt_table_parse_mountinfo(struct libmnt_table *tb, const char *filename,
 
 	if (!is_mountinfo(tb))
 		return 0;
-	DBG_OBJ(TAB, tb, ul_debug("mountinfo parse: #2 read utab"));
 
-	if (mnt_table_get_nents(tb) == 0)
-		return 0;			/* empty, ignore utab */
-	/*
-	 * try to read the user specific information from /run/mount/utabs
-	 */
-	if (!u_tb) {
-		const char *utab = mnt_get_utab_path();
-
-		if (!utab || is_file_empty(utab))
-			return 0;
-
-		u_tb = mnt_new_table();
-		if (!u_tb)
-			return -ENOMEM;
-
-		u_tb->fmt = MNT_FMT_UTAB;
-		mnt_table_set_parser_fltrcb(u_tb, tb->fltrcb, tb->fltrcb_data);
-
-		rc = mnt_table_parse_file(u_tb, utab);
-		priv_utab = 1;
-	}
-
-	DBG_OBJ(TAB, tb, ul_debug("mountinfo parse: #3 merge utab"));
-
-	if (rc == 0) {
-		struct libmnt_fs *u_fs;
-		struct libmnt_iter itr;
-
-		mnt_reset_iter(&itr, MNT_ITER_BACKWARD);
-
-		/*  merge user options into mountinfo from the kernel */
-		while(mnt_table_next_fs(u_tb, &itr, &u_fs) == 0)
-			mnt_table_merge_user_fs(tb, u_fs);
-	}
-
-
-	if (priv_utab)
-		mnt_unref_table(u_tb);
-	return 0;
+	DBG_OBJ(TAB, tb, ul_debug("mountinfo parse: #2 merge utab"));
+	return mnt_table_merge_utab(tb, u_tb);
 }
+
 /**
  * mnt_table_parse_mtab:
  * @tb: table

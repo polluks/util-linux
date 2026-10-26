@@ -56,6 +56,9 @@
 #include "idcache.h"
 #include "pathnames.h"
 #include "pidfd-utils.h"
+#include "optutils.h"
+#include "xalloc.h"
+#include "buffer.h"
 
 #include "lsfd.h"
 
@@ -186,6 +189,18 @@ static const struct colinfo infos[] = {
 	[COL_BLKDRV]           = { "BLKDRV",
 				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_STRING,
 				   N_("block device driver name resolved by /proc/devices") },
+	[COL_BPF_LINK_ID]      = { "BPF-LINK.ID",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("bpf link ID") },
+	[COL_BPF_LINK_TYPE]    = { "BPF-LINK.TYPE",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_STRING,
+				   N_("bpf link type (decoded)") },
+	[COL_BPF_LINK_TYPE_RAW]= { "BPF-LINK.TYPE.RAW",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("bpf link type (raw)") },
+	[COL_BPF_LINK_PROG_ID] = { "BPF-LINK.PROG-ID",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("bpf prog ID that this link attaches") },
 	[COL_BPF_MAP_ID]       = { "BPF-MAP.ID",
 				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
 				   N_("bpf map id associated with the fd") },
@@ -264,6 +279,45 @@ static const struct colinfo infos[] = {
 	[COL_INOTIFY_INODES_RAW]={ "INOTIFY.INODES.RAW",
 				   0,   SCOLS_FL_WRAP,  SCOLS_JSON_ARRAY_STRING,
 				   N_("list of monitoring inodes (raw, don't decode devices)") },
+	[COL_IO_URING_CQ_HEAD] = { "IO-URING.CQ-HEAD",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring completion queue head") },
+	[COL_IO_URING_CQ_MASK] = { "IO-URING.CQ-MASK",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring completion queue ring mask") },
+	[COL_IO_URING_CQ_TAIL] = { "IO-URING.CQ-TAIL",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring completion queue tail") },
+	[COL_IO_URING_CQES]    = { "IO-URING.CQES",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring unconsumed completion queue entries") },
+	[COL_IO_URING_NAPI]    = { "IO-URING.NAPI",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_STRING,
+				   N_("io_uring NAPI mode") },
+	[COL_IO_URING_SQ_HEAD] = { "IO-URING.SQ-HEAD",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring submission queue head") },
+	[COL_IO_URING_SQ_MASK] = { "IO-URING.SQ-MASK",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring submission queue ring mask") },
+	[COL_IO_URING_SQ_TAIL] = { "IO-URING.SQ-TAIL",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring submission queue tail") },
+	[COL_IO_URING_SQES]    = { "IO-URING.SQES",
+				   0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				   N_("io_uring unconsumed submission queue entries") },
+	[COL_IO_URING_SQTHREAD] = { "IO-URING.SQTHREAD",
+				    0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				    N_("io_uring SQ poll kernel thread PID") },
+	[COL_IO_URING_SQTHREAD_CPU] = { "IO-URING.SQTHREAD-CPU",
+					0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+					N_("io_uring SQ poll thread CPU affinity") },
+	[COL_IO_URING_USER_BUFS] = { "IO-URING.USER-BUFS",
+				     0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				     N_("io_uring count of registered buffers") },
+	[COL_IO_URING_USER_FILES] = { "IO-URING.USER-FILES",
+				      0,   SCOLS_FL_RIGHT, SCOLS_JSON_NUMBER,
+				      N_("io_uring count of registered files") },
 	[COL_KNAME]            = { "KNAME",
 				   0.4, SCOLS_FL_TRUNC, SCOLS_JSON_STRING,
 				   N_("name of the file (raw)"),
@@ -901,7 +955,7 @@ static struct file *collect_file_symlink(struct path_cxt *pc,
 					 struct proc *proc,
 					 const char *name,
 					 int assoc,
-					 bool sockets_only)
+					 bool sockets_and_ns_only)
 {
 	char sym[PATH_MAX] = { '\0' };
 	struct stat sb = { .st_mode = 0 };
@@ -914,7 +968,7 @@ static struct file *collect_file_symlink(struct path_cxt *pc,
 	else {
 		const struct file_class *class = stat2class(&sb);
 
-		if (sockets_only
+		if (sockets_and_ns_only
 		    /* A nsfs file is not a socket but the nsfs file can
 		     * be used as a entry point to collect information from
 		     * other network namespaces. Based on the information,
@@ -1069,7 +1123,8 @@ static void parse_maps_line(struct path_cxt *pc, char *buf, struct proc *proc)
 		struct statx stx;
 		if (ul_path_statxf(pc, &stx, AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC,
 				   STATX_MNT_ID,
-				   "map_files/%"PRIx64"-%"PRIx64, start, end) == 0)
+				   "map_files/%"PRIx64"-%"PRIx64, start, end) == 0
+		    && (stx.stx_mask & STATX_MNT_ID))
 			f->mnt_id = stx.stx_mnt_id;
 	}
 #endif	/* defined(HAVE_STATX) && defined(HAVE_STRUCT_STATX_STX_MNT_ID) */
@@ -1092,24 +1147,40 @@ static void collect_mem_files(struct path_cxt *pc, struct proc *proc)
 	fclose(fp);
 }
 
+enum outofbox_attrs {
+	OUTOFBOX_NAMESPACE = (1 << 0),
+};
+
+struct outofbox_fdecl {
+	enum association assoc;
+	const char *name;
+	unsigned int attrs;
+};
+
+#define LAST_OUTOFBOX_FDECL { .name = NULL }
+
 static void collect_outofbox_files(struct path_cxt *pc,
 				   struct proc *proc,
-				   enum association assocs[],
-				   const char *names[],
-				   size_t count,
+				   const struct outofbox_fdecl fdecls[],
 				   bool sockets_only)
 {
-	size_t i;
+	const struct outofbox_fdecl *fdecl;
 
-	for (i = 0; i < count; i++) {
-		struct file *f __attribute__((unused))
-			= collect_file_symlink(pc, proc, names[assocs[i]], assocs[i] * -1,
-					       sockets_only);
+	for (fdecl = fdecls; fdecl->name; fdecl++) {
+		bool is_ns = (fdecl->attrs & OUTOFBOX_NAMESPACE);
+		struct file *f __attribute__((unused));
+
+		if (sockets_only && !is_ns)
+			continue;
+
+		f = collect_file_symlink(pc, proc, fdecl->name, fdecl->assoc * -1,
+					 sockets_only);
 #if defined(HAVE_STATX) && defined(HAVE_STRUCT_STATX_STX_MNT_ID)
 		if (f && has_mnt_id(f)) {
 			struct statx stx;
-			if (ul_path_statx(pc, &stx, AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC,
-					  STATX_MNT_ID, names[assocs[i]]) == 0)
+			if ((ul_path_statx(pc, &stx, AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC,
+					   STATX_MNT_ID, fdecl->name) == 0)
+			    && (stx.stx_mask & STATX_MNT_ID))
 				f->mnt_id = stx.stx_mnt_id;
 		}
 #endif	/* #if defined(HAVE_STATX) && defined(HAVE_STRUCT_STATX_STX_MNT_ID) */
@@ -1119,12 +1190,14 @@ static void collect_outofbox_files(struct path_cxt *pc,
 static void collect_execve_file(struct path_cxt *pc, struct proc *proc,
 				bool sockets_only)
 {
-	enum association assocs[] = { ASSOC_EXE };
-	const char *names[] = {
-		[ASSOC_EXE]  = "exe",
+	static const struct outofbox_fdecl fdecls[] = {
+		{
+			.assoc = ASSOC_EXE,
+			.name = "exe",
+		},
+		LAST_OUTOFBOX_FDECL,
 	};
-	collect_outofbox_files(pc, proc, assocs, names, ARRAY_SIZE(assocs),
-			       sockets_only);
+	collect_outofbox_files(pc, proc, fdecls, sockets_only);
 }
 
 static int collect_pidfs_file(struct proc *proc, bool sockets_only)
@@ -1181,55 +1254,86 @@ static int collect_pidfs_file(struct proc *proc, bool sockets_only)
 static void collect_fs_files(struct path_cxt *pc, struct proc *proc,
 			     bool sockets_only)
 {
-	enum association assocs[] = { ASSOC_CWD, ASSOC_ROOT };
-	const char *names[] = {
-		[ASSOC_CWD]  = "cwd",
-		[ASSOC_ROOT] = "root",
+	static const struct outofbox_fdecl fdecls[] = {
+		{
+			.assoc = ASSOC_CWD,
+			.name = "cwd",
+		},
+		{
+			.assoc = ASSOC_ROOT,
+			.name = "root",
+		},
+		LAST_OUTOFBOX_FDECL,
 	};
-	collect_outofbox_files(pc, proc, assocs, names, ARRAY_SIZE(assocs),
-			       sockets_only);
+	collect_outofbox_files(pc, proc, fdecls, sockets_only);
 }
 
-static void collect_namespace_files_tophalf(struct path_cxt *pc, struct proc *proc)
+static void collect_namespace_files_tophalf(struct path_cxt *pc, struct proc *proc,
+					    bool sockets_only)
 {
-	enum association assocs[] = {
-		ASSOC_NS_CGROUP,
-		ASSOC_NS_IPC,
-		ASSOC_NS_MNT,
+	static const struct outofbox_fdecl fdecls[] = {
+		{
+			.assoc = ASSOC_NS_CGROUP,
+			.name = "ns/cgroup",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_IPC,
+			.name = "ns/ipc",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_MNT,
+			.name = "ns/mnt",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		LAST_OUTOFBOX_FDECL,
 	};
-	const char *names[] = {
-		[ASSOC_NS_CGROUP] = "ns/cgroup",
-		[ASSOC_NS_IPC]    = "ns/ipc",
-		[ASSOC_NS_MNT]    = "ns/mnt",
-	};
-	collect_outofbox_files(pc, proc, assocs, names, ARRAY_SIZE(assocs),
-			       /* Namespace information is always needed. */
-			       false);
+	collect_outofbox_files(pc, proc, fdecls, sockets_only);
 }
 
-static void collect_namespace_files_bottomhalf(struct path_cxt *pc, struct proc *proc)
+static void collect_namespace_files_bottomhalf(struct path_cxt *pc, struct proc *proc,
+					       bool sockets_only)
 {
-	enum association assocs[] = {
-		ASSOC_NS_NET,
-		ASSOC_NS_PID,
-		ASSOC_NS_PID4C,
-		ASSOC_NS_TIME,
-		ASSOC_NS_TIME4C,
-		ASSOC_NS_USER,
-		ASSOC_NS_UTS,
+	static const struct outofbox_fdecl fdecls[] = {
+		{
+			.assoc = ASSOC_NS_NET,
+			.name = "ns/net",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_PID,
+			.name = "ns/pid",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_PID4C,
+			.name = "ns/pid_for_children",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_TIME,
+			.name = "ns/time",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_TIME4C,
+			.name = "ns/time_for_children",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_USER,
+			.name = "ns/user",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		{
+			.assoc = ASSOC_NS_UTS,
+			.name = "ns/uts",
+			.attrs = OUTOFBOX_NAMESPACE,
+		},
+		LAST_OUTOFBOX_FDECL,
 	};
-	const char *names[] = {
-		[ASSOC_NS_NET]    = "ns/net",
-		[ASSOC_NS_PID]    = "ns/pid",
-		[ASSOC_NS_PID4C]  = "ns/pid_for_children",
-		[ASSOC_NS_TIME]   = "ns/time",
-		[ASSOC_NS_TIME4C] = "ns/time_for_children",
-		[ASSOC_NS_USER]   = "ns/user",
-		[ASSOC_NS_UTS]    = "ns/uts",
-	};
-	collect_outofbox_files(pc, proc, assocs, names, ARRAY_SIZE(assocs),
-			       /* Namespace information is always needed. */
-			       false);
+	collect_outofbox_files(pc, proc, fdecls, sockets_only);
 }
 
 static void reset_cooked_bdev(struct cooked_bdev *bdev, dev_t raw, const char *filesystem)
@@ -1952,9 +2056,7 @@ static void mark_poll_fds_as_multiplexed(char *buf,
 		return;
 
 	local.iov_len = sizeof(struct pollfd) * nfds;
-	local.iov_base = malloc(local.iov_len);
-	if (!local.iov_base)
-		goto out;
+	local.iov_base = xmalloc(local.iov_len);
 
 	remote.iov_len = local.iov_len;
 	remote.iov_base = (void *)fds;
@@ -2095,20 +2197,22 @@ static void read_process(struct lsfd_control *ctl, struct path_cxt *pc,
 	if (procfs_process_get_stat(pc, buf, sizeof(buf)) > 0) {
 		char *p;
 		unsigned int flags;
-		char *pat = NULL;
+		struct ul_buffer ul_buf = UL_INIT_BUFFER;
+		char *pat;
 
 		/* See proc(5) about the column in the line. */
-		xstrappend(&pat, "%*d (");
+		ul_buffer_xappend_string(&ul_buf, "%*d (");
 		for (p = proc->command; *p != '\0'; p++) {
 			if (*p == '%')
-				xstrappend(&pat, "%%");
+				ul_buffer_xappend_string(&ul_buf, "%%");
 			else
-				xstrputc(&pat, *p);
+				ul_buffer_xappend_char(&ul_buf, *p);
 		}
-		xstrappend(&pat, ") %*c %*d %*d %*d %*d %*d %u %*[^\n]");
+		ul_buffer_xappend_string(&ul_buf, ") %*c %*d %*d %*d %*d %*d %u %*[^\n]");
+		pat = ul_buffer_get_data(&ul_buf, NULL, NULL);
 		if (sscanf(buf, pat, &flags) == 1)
 			proc->kthread = !!(flags & PF_KTHREAD);
-		free(pat);
+		ul_buffer_free_data(&ul_buf);
 	}
 	if (proc->kthread && !ctl->threads) {
 		free_proc(proc);
@@ -2143,7 +2247,7 @@ static void read_process(struct lsfd_control *ctl, struct path_cxt *pc,
 
 	/* 1/3. Read /proc/$pid/ns/mnt */
 	if (proc->mnt_ns == NULL)
-		collect_namespace_files_tophalf(pc, proc);
+		collect_namespace_files_tophalf(pc, proc, ctl->sockets_only);
 
 	/* 2/3. read /proc/$pid/mountinfo unless we have read it already.
 	 * The backing device for "nsfs" is solved here.
@@ -2167,7 +2271,7 @@ static void read_process(struct lsfd_control *ctl, struct path_cxt *pc,
 	 * When reading the information about the net namespace,
 	 * backing device for "nsfs" must be solved.
 	 */
-	collect_namespace_files_bottomhalf(pc, proc);
+	collect_namespace_files_bottomhalf(pc, proc, ctl->sockets_only);
 
 	/* If kcmp is not available,
 	 * there is no way to know whether threads share resources.
@@ -2705,6 +2809,12 @@ int main(int argc, char *argv[])
 		{ NULL, 0, NULL, 0 },
 	};
 
+	static const ul_excl_t excl[] = {       /* rows and cols in ASCII order */
+		{ 'J', 'r' },
+		{ 0 }
+	};
+	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
+
 	lsfd_init_debug();
 
 	setlocale(LC_ALL, "");
@@ -2713,6 +2823,8 @@ int main(int argc, char *argv[])
 	close_stdout_atexit();
 
 	while ((c = getopt_long(argc, argv, "no:JrVhluQ:p:i::C:sH", longopts, NULL)) != -1) {
+		err_exclusive_options(c, longopts, excl, excl_st);
+
 		switch (c) {
 		case 'n':
 			ctl.noheadings = 1;
@@ -2800,6 +2912,16 @@ int main(int argc, char *argv[])
 		default:
 			errtryhelp(EXIT_FAILURE);
 		}
+	}
+
+	if (ctl.uri) {
+		char *badopt =
+			ctl.json ? "json" :
+			ctl.raw  ? "raw"  :
+			NULL;
+		if (badopt)
+			errexclusive(OPTUTILS_EXIT_CODE,
+				     "--", "hyperlink", "--", badopt);
 	}
 
 	if (collist)

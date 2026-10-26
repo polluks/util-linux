@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 # Copyright (C) 2023 Thomas Weißschuh <thomas@t-8ch.de>
+# Copyright (C) 2026 Skye Soss <skye@soss.website>
 #
 # This file is part of util-linux.
 #
@@ -23,12 +24,13 @@ ts_init "$*"
 [[ "$COVERAGE" = yes ]] && ts_skip "does not work with coverage"
 
 ts_check_test_command "$TS_CMD_SETPRIV"
+ts_check_test_command "$TS_HELPER_MKFDS"
 
-"$TS_CMD_SETPRIV" --landlock-access fs \
-	--landlock-rule path-beneath:execute:/ \
-	--landlock-rule path-beneath:read-file:/ \
-	true \
-	|| ts_skip "no landlock support in setpriv"
+if ! landlock_support="$("$TS_CMD_SETPRIV" --landlock-support)"; then
+	ts_skip "no Landlock support in setpriv"
+fi
+
+abi_version="$(echo "$landlock_support" | sed -n 's/ABI version: \([0-9]\+\)/\1/p')"
 
 ts_init_subtest "nothing-allowed"
 "$TS_CMD_SETPRIV" --landlock-access fs true &> "$TS_OUTPUT"
@@ -36,13 +38,13 @@ ts_finalize_subtest
 
 ts_init_subtest "partial-access-fail"
 "$TS_CMD_SETPRIV" --landlock-access \
-	fs:write cp /dev/null /dev/zero \
+	fs:write-file cp /dev/null /dev/zero \
 	&> "$TS_OUTPUT"
 ts_finalize_subtest
 
 ts_init_subtest "partial-access-success"
 "$TS_CMD_SETPRIV" \
-	--landlock-access fs:write --landlock-rule path-beneath:write:/dev/zero \
+	--landlock-access fs:write-file --landlock-rule path-beneath:write-file:/dev/zero \
 	cp /dev/null /dev/zero \
 	&> "$TS_OUTPUT"
 ts_finalize_subtest
@@ -59,6 +61,226 @@ ts_init_subtest "wildcard-access"
 	--landlock-rule path-beneath::/ \
 	true \
 	&> "$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "wildcard-partial-access"
+"$TS_CMD_SETPRIV" --landlock-access fs:execute \
+	--landlock-rule path-beneath::/ \
+	true \
+	&> "$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "wildcard-partial-access-reversed"
+"$TS_CMD_SETPRIV" --landlock-rule path-beneath::/ \
+	--landlock-access fs:execute \
+	true \
+	&> "$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "net-unsupported"
+if [[ "$abi_version" -ge 4 ]]; then
+	ts_skip "landlock network restrictions are supported"
+else
+	"$TS_CMD_SETPRIV" --landlock-access net true &> "$TS_OUTPUT"
+fi
+ts_finalize_subtest
+
+ts_init_subtest "scope-unsupported"
+if [[ "$abi_version" -ge 6 ]]; then
+	ts_skip "landlock scope restrictions are supported"
+else
+	"$TS_CMD_SETPRIV" --landlock-access scope true &> "$TS_OUTPUT"
+fi
+ts_finalize_subtest
+
+background_pid=
+cleanup()
+{
+	if [[ -n "$background_pid" ]]; then
+		kill "$background_pid" 2> /dev/null
+		wait "$background_pid" 2> /dev/null
+		background_pid=
+	fi
+}
+trap cleanup EXIT
+
+net_port=$((30000 + $$ % 10000))
+
+ts_init_subtest "net-invalid-port"
+if [[ "$abi_version" -lt 4 ]]; then
+	ts_skip "landlock network restrictions are not supported"
+else
+	"$TS_CMD_SETPRIV" --landlock-access net \
+		--landlock-rule net-port:bind-tcp:65536 \
+		true &> "$TS_OUTPUT"
+fi
+ts_finalize_subtest
+
+## Landlock network rights
+
+net_tests_issue=
+if [[ "$abi_version" -lt 4 ]]; then
+	net_tests_issue="landlock network restrictions are not supported"
+elif ! "$TS_HELPER_MKFDS" --is-available tcp-listen \
+        || ! "$TS_HELPER_MKFDS" --is-available tcp-connect; then
+	net_tests_issue="test_mkfds has no tcp-listen or tcp-connect factory"
+elif ! "$TS_HELPER_MKFDS" -c -q tcp-listen 3 server-port="$net_port" &> /dev/null; then
+	net_tests_issue="cannot bind TCP port $net_port"
+fi
+
+ts_init_subtest "net-bind-blocked"
+if [[ -n "$net_tests_issue" ]]; then
+	ts_skip "$net_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access net:bind-tcp \
+		"$TS_HELPER_MKFDS" -c -q tcp-listen 3 server-port="$net_port" \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+ts_init_subtest "net-bind-allowed"
+if [[ -n "$net_tests_issue" ]]; then
+	ts_skip "$net_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access net:bind-tcp \
+		--landlock-rule net-port:bind-tcp:"$net_port" \
+		"$TS_HELPER_MKFDS" -c -q tcp-listen 3 server-port="$net_port" \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+tcp_listener=
+if [[ -z "$net_tests_issue" ]]; then
+	coproc TCP_LISTEN { "$TS_HELPER_MKFDS" tcp-listen 3 server-port="$net_port" 2> /dev/null; }
+	if ! read -r -u "${TCP_LISTEN[0]}" tcp_listener; then
+		net_tests_issue="cannot listen on TCP port $net_port"
+	elif ! "$TS_HELPER_MKFDS" -c -q tcp-connect 3 server-port="$net_port" &> /dev/null; then
+		net_tests_issue="cannot connect to TCP port $net_port"
+	fi
+fi
+
+ts_init_subtest "net-connect-blocked"
+if [[ -n "$net_tests_issue" ]]; then
+	ts_skip "$net_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access net:connect-tcp \
+		"$TS_HELPER_MKFDS" -c -q tcp-connect 3 server-port="$net_port" \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+ts_init_subtest "net-connect-allowed"
+if [[ -n "$net_tests_issue" ]]; then
+	ts_skip "$net_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access net:connect-tcp \
+		--landlock-rule net-port:connect-tcp:"$net_port" \
+		"$TS_HELPER_MKFDS" -c -q tcp-connect 3 server-port="$net_port" \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+if [[ -n "$tcp_listener" ]]; then
+	echo DONE >&"${TCP_LISTEN[1]}"
+	wait "$TCP_LISTEN_PID"
+	tcp_listener=
+fi
+
+# Both scopes appeared in ABI 6, so each one can serve as the control of
+# the other: it must leave the operation the other one blocks alone.
+signal_tests_issue=
+if [[ "$abi_version" -lt 6 ]]; then
+	signal_tests_issue="landlock scopes are not supported"
+elif ! type "$TS_CMD_KILL" > /dev/null 2>&1; then
+	signal_tests_issue="kill is unavailable"
+else
+	# The sleep process remains outside the new Landlock domain.
+	sleep 60 &
+	background_pid=$!
+fi
+
+ts_init_subtest "scope-signal-blocked"
+if [[ -n "$signal_tests_issue" ]]; then
+	ts_skip "$signal_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access scope:signal \
+		"$TS_CMD_KILL" -0 "$background_pid" \
+        2>&1 >>"$TS_OUTPUT" | sed 's/'"$background_pid"'\+/<pid>/g' >>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+ts_init_subtest "scope-signal-allowed"
+if [[ -n "$signal_tests_issue" ]]; then
+	ts_skip "$signal_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access scope:abstract-unix-socket \
+		"$TS_CMD_KILL" -0 "$background_pid" \
+        >>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+cleanup
+
+socket_name="util-linux-setpriv-$$"
+unix_listener=
+
+unix_tests_issue=
+if [[ "$abi_version" -lt 6 ]]; then
+	unix_tests_issue="landlock scopes are not supported"
+elif ! "$TS_HELPER_MKFDS" --is-available unix-stream-listen \
+        || ! "$TS_HELPER_MKFDS" --is-available unix-stream-connect; then
+	unix_tests_issue="test_mkfds has no unix-stream-listen or unix-stream-connect factory"
+else
+	coproc UNIX_LISTEN { "$TS_HELPER_MKFDS" unix-stream-listen 3 \
+				path="$socket_name" abstract=1 2> /dev/null; }
+	if ! read -r -u "${UNIX_LISTEN[0]}" unix_listener; then
+		unix_tests_issue="cannot listen on abstract UNIX socket $socket_name"
+	elif ! "$TS_HELPER_MKFDS" -c -q unix-stream-connect 3 \
+			path="$socket_name" abstract=1 > /dev/null 2>>"$TS_ERRLOG"; then
+		unix_tests_issue="cannot connect to abstract UNIX socket $socket_name"
+	fi
+fi
+
+ts_init_subtest "scope-abstract-unix-socket-blocked"
+if [[ -n "$unix_tests_issue" ]]; then
+	ts_skip "$unix_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access scope:abstract-unix-socket \
+		"$TS_HELPER_MKFDS" -c -q unix-stream-connect 3 \
+		path="$socket_name" abstract=1 \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+ts_init_subtest "scope-abstract-unix-socket-allowed"
+if [[ -n "$unix_tests_issue" ]]; then
+	ts_skip "$unix_tests_issue"
+else
+    "$TS_CMD_SETPRIV" --landlock-access scope:signal \
+		"$TS_HELPER_MKFDS" -c -q unix-stream-connect 3 \
+		path="$socket_name" abstract=1 \
+		>>"$TS_OUTPUT" 2>>"$TS_ERRLOG"
+fi
+ts_finalize_subtest
+
+if [[ -n "$unix_listener" ]]; then
+	echo DONE >&"${UNIX_LISTEN[1]}"
+	wait "$UNIX_LISTEN_PID"
+	unix_listener=
+fi
+
+## Invalid Landlock rule/right
+
+ts_init_subtest "invalid-access"
+"$TS_CMD_SETPRIV" --landlock-access invalid true &> "$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "invalid-fs-right"
+"$TS_CMD_SETPRIV" --landlock-access fs:an-invalid-right true &> "$TS_OUTPUT"
+ts_finalize_subtest
+
+ts_init_subtest "abbreviated-fs-right"
+"$TS_CMD_SETPRIV" --landlock-access fs:remove true &> "$TS_OUTPUT"
 ts_finalize_subtest
 
 ts_finalize

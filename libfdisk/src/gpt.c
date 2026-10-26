@@ -721,30 +721,6 @@ static struct gpt_header *gpt_copy_header(struct fdisk_context *cxt,
 	return res;
 }
 
-static int get_script_u64(struct fdisk_context *cxt, uint64_t *num, const char *name)
-{
-	const char *str;
-	int pwr = 0, rc = 0;
-
-	assert(cxt);
-
-	*num = 0;
-
-	if (!cxt->script)
-		return 1;
-
-	str = fdisk_script_get_header(cxt->script, name);
-	if (!str)
-		return 1;
-
-	rc = ul_parse_size(str, (uintmax_t *) num, &pwr);
-	if (rc < 0)
-		return rc;
-	if (pwr)
-		*num /= cxt->sector_size;
-	return 0;
-}
-
 static int count_first_last_lba(struct fdisk_context *cxt,
 				 uint64_t *first, uint64_t *last,
 				 uint32_t *maxents)
@@ -761,7 +737,7 @@ static int count_first_last_lba(struct fdisk_context *cxt,
 
 	/* Get the table length from the script, if given */
 	if (cxt->script) {
-		rc = get_script_u64(cxt, &nents, "table-length");
+		rc = fdisk_script_get_u64(cxt, "table-length", &nents);
 		if (rc == 1)
 			nents = GPT_NPARTITIONS;  /* undefined by script */
 		else if (rc < 0)
@@ -792,7 +768,7 @@ static int count_first_last_lba(struct fdisk_context *cxt,
 
 	/* script default */
 	if (cxt->script) {
-		rc = get_script_u64(cxt, first, "first-lba");
+		rc = fdisk_script_get_u64(cxt, "first-lba", first);
 		if (rc < 0)
 			return rc;
 
@@ -804,7 +780,7 @@ static int count_first_last_lba(struct fdisk_context *cxt,
 			return -ERANGE;
 		}
 
-		rc = get_script_u64(cxt, last, "last-lba");
+		rc = fdisk_script_get_u64(cxt, "last-lba", last);
 		if (rc < 0)
 			return rc;
 
@@ -999,9 +975,9 @@ static ssize_t read_lba(struct fdisk_context *cxt, uint64_t lba,
 {
 	off_t offset = lba * cxt->sector_size;
 
-	if (lseek(cxt->dev_fd, offset, SEEK_SET) == (off_t) -1)
+	if (ul_vfs_lseek(cxt->vfs, cxt->dev_fd, offset, SEEK_SET) == (off_t) -1)
 		return -1;
-	return (size_t)read(cxt->dev_fd, buffer, bytes) != bytes;
+	return (size_t)ul_vfs_read(cxt->vfs, cxt->dev_fd, buffer, bytes) != bytes;
 }
 
 
@@ -1033,10 +1009,10 @@ static unsigned char *gpt_read_entries(struct fdisk_context *cxt,
 	offset = (off_t) le64_to_cpu(header->partition_entry_lba) *
 		       cxt->sector_size;
 
-	if (offset != lseek(cxt->dev_fd, offset, SEEK_SET))
+	if (offset != ul_vfs_lseek(cxt->vfs, cxt->dev_fd, offset, SEEK_SET))
 		goto fail;
 
-	ssz = read(cxt->dev_fd, ret, sz);
+	ssz = ul_vfs_read(cxt->vfs, cxt->dev_fd, ret, sz);
 	if (ssz < 0 || (size_t) ssz != sz)
 		goto fail;
 
@@ -1124,6 +1100,17 @@ static int gpt_check_entryarr_crc(struct gpt_header *header, unsigned char *ents
 
 	return gpt_entryarr_count_crc32(header, ents) ==
 			le32_to_cpu(header->partition_entry_array_crc32);
+}
+
+/*
+ * Returns 1 if both headers describe partition entries arrays of the same
+ * size (number of entries and entry size), otherwise 0.
+ */
+static int gpt_headers_same_entries(const struct gpt_header *a,
+				    const struct gpt_header *b)
+{
+	return a->npartition_entries == b->npartition_entries &&
+	       a->sizeof_partition_entry == b->sizeof_partition_entry;
 }
 
 static int gpt_check_lba_sanity(struct fdisk_context *cxt, struct gpt_header *header)
@@ -1665,12 +1652,22 @@ static int gpt_probe_label(struct fdisk_context *cxt)
 	gpt->pheader = gpt_read_header(cxt, GPT_PRIMARY_PARTITION_TABLE_LBA,
 				       &gpt->ents);
 
-	if (gpt->pheader)
+	if (gpt->pheader) {
 		/* primary OK, try backup from alternative LBA */
 		gpt->bheader = gpt_read_header(cxt,
 					le64_to_cpu(gpt->pheader->alternative_lba),
 					NULL);
-	else
+
+		/* Only the primary entries array is kept in memory, and both
+		 * headers are used with it (CRCs, write). The backup header has
+		 * to describe an array of the same geometry. */
+		if (gpt->bheader &&
+		    !gpt_headers_same_entries(gpt->pheader, gpt->bheader)) {
+			DBG(GPT, ul_debug("backup header entries geometry differs from primary"));
+			free(gpt->bheader);
+			gpt->bheader = NULL;
+		}
+	} else
 		/* primary corrupted -- try last LBA */
 		gpt->bheader = gpt_read_header(cxt, last_lba(cxt), &gpt->ents);
 
@@ -2064,10 +2061,10 @@ static int gpt_set_partition(struct fdisk_context *cxt, size_t n,
 
 static int gpt_read(struct fdisk_context *cxt, off_t offset, void *buf, size_t count)
 {
-	if (offset != lseek(cxt->dev_fd, offset, SEEK_SET))
+	if (offset != ul_vfs_lseek(cxt->vfs, cxt->dev_fd, offset, SEEK_SET))
 		return -errno;
 
-	if (read_all(cxt->dev_fd, buf, count))
+	if (ul_vfs_read_all(cxt->vfs, cxt->dev_fd, buf, count))
 		return -errno;
 
 	DBG(GPT, ul_debug("  read OK [offset=%zu, size=%zu]",
@@ -2077,13 +2074,13 @@ static int gpt_read(struct fdisk_context *cxt, off_t offset, void *buf, size_t c
 
 static int gpt_write(struct fdisk_context *cxt, off_t offset, void *buf, size_t count)
 {
-	if (offset != lseek(cxt->dev_fd, offset, SEEK_SET))
+	if (offset != ul_vfs_lseek(cxt->vfs, cxt->dev_fd, offset, SEEK_SET))
 		return -errno;
 
-	if (write_all(cxt->dev_fd, buf, count))
+	if (ul_vfs_write_all(cxt->vfs, cxt->dev_fd, buf, count))
 		return -errno;
 
-	if (fsync(cxt->dev_fd) != 0)
+	if (ul_vfs_fsync(cxt->vfs, cxt->dev_fd) != 0)
 		return -errno;
 
 	DBG(GPT, ul_debug("  write OK [offset=%zu, size=%zu]",
@@ -2881,7 +2878,7 @@ int fdisk_gpt_set_npartitions(struct fdisk_context *cxt, uint32_t nents)
 	struct fdisk_gpt_label *gpt;
 	size_t new_size = 0;
 	uint32_t old_nents;
-	uint64_t first_usable = 0ULL, last_usable = 0ULL;
+	uint64_t first_usable = 0ULL, last_usable = 0ULL, esects = 0ULL;
 	int rc;
 
 	assert(cxt);
@@ -2909,11 +2906,18 @@ int fdisk_gpt_set_npartitions(struct fdisk_context *cxt, uint32_t nents)
 		return rc;
 	}
 
-	rc = gpt_calculate_first_lba(gpt->pheader, nents, &first_usable, cxt);
+	/* The primary entries array is not relocated when the table length
+	 * changes, so derive the first usable LBA from its real on-disk
+	 * location rather than the default LBA 2. */
+	rc = gpt_calculate_sectorsof_entries(gpt->pheader, nents, &esects, cxt);
+	if (rc == 0)
+		first_usable = le64_to_cpu(gpt->pheader->partition_entry_lba) + esects;
 	if (rc == 0)
 		rc = gpt_calculate_last_lba(gpt->pheader, nents, &last_usable, cxt);
 	if (rc)
 		return rc;
+	if (first_usable > last_usable)
+		return -ENOSPC;
 
 	/* if expanding the table, first check that everything fits,
 	 * then allocate more memory and zero. */
